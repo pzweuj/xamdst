@@ -608,11 +608,18 @@ static float coverage_cal(const uint32_t *array, int l)
     return cov * 100;
 }
 
-// FIXME: need broken when bed file is truncated
+// 加载并初始化 BED 文件，包含截断检测
 int load_bed_init(char const *fn, aux_t *a)
 {
     int ret = 0;
-    bedHand->read(fn, a->h_tgt, 0, 0, &ret);
+    int read_ret = bedHand->read(fn, a->h_tgt, 0, 0, &ret);
+    
+    // 检查 BED 文件是否被截断或读取失败
+    if (read_ret < 0)
+    {
+        errabort("Failed to read BED file: %s (file may be truncated or corrupted)", fn);
+    }
+    
     if (zero_based && ret)
     {
         warnings("This region is not a standard bed format.\n"
@@ -1071,7 +1078,17 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
 
             // if tid != c->tid, completed the stat of the last chromosome
             // init the new chromosome node and clean the memory
-            // FIXME: need multi thread to improve it or NOT?
+            // 
+            // 多线程优化说明：
+            // 当前实现是单线程顺序处理，可以考虑以下多线程方案：
+            // 1. 按染色体并行：每个线程处理一个染色体的深度统计
+            //    - 优点：实现简单，线程间无数据竞争
+            //    - 缺点：需要预先读取整个 BAM 文件或使用索引
+            // 2. 生产者-消费者模式：一个线程读取 BAM，多个线程统计
+            //    - 优点：可以流式处理
+            //    - 缺点：需要线程安全的队列和同步机制
+            // 目前保持单线程实现，因为 I/O 通常是瓶颈
+            //
             if (para->tid != c->tid)
             {
                 goto_next_chromosome = FALSE; // clean the flag of skiping
@@ -1133,15 +1150,20 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
                 para->flk_node = bed_depnode_list(para->flk);
                 para->tar->flag = para->flk->flag = 1;
 
-                /* the next part is init uncover region hash*/
+                /* 初始化 uncover region hash
+                 * 注意：这里不能直接使用 ucreg_tmp 指针，因为 kh_val 返回的是值的拷贝
+                 * 我们需要获取 hash 表中实际存储位置的地址
+                 * 这样后续对 para->ucreg 的修改才能反映到 hash 表中
+                 */
                 k = kh_put(reg, h_uncov, strdup(para->name), &ret);
 
                 bedreglist_t *ucreg_tmp;
                 ucreg_tmp = (bedreglist_t *)needmem(sizeof(bedreglist_t));
+                memset(ucreg_tmp, 0, sizeof(bedreglist_t));  // 确保初始化为零
                 kh_val(h_uncov, k) = *ucreg_tmp;
-                para->ucreg = &kh_val(h_uncov, k); // FIXME: I don't understand why
-                                                   // couldn't use ucreg_tmp directly
-                                                   /* finish init */
+                mustfree(ucreg_tmp);  // 释放临时变量，数据已拷贝到 hash 表
+                para->ucreg = &kh_val(h_uncov, k);  // 获取 hash 表中的实际地址
+                /* finish init */
             }
             while (para->flk_node && para->flk_node->stop < para->lstpos + 1)
             {
@@ -1434,20 +1456,44 @@ void cntcov_cal_ratio(struct opt_aux *f, struct regcov *cov, count32_t *cnt, uin
     }
 }
 
-// FIXME: need improve soon!!!
+// 计算深度分布的中位数
+// 使用累积分布查找，时间复杂度 O(n)
 float median_cnt(count32_t *cnt)
 {
+    if (cnt->m == 0)
+        return 0;
+    
     int i;
     uint64_t sum = 0;
+    
+    // 计算总数
     for (i = 0; i < cnt->m; ++i)
         sum += (uint64_t)cnt->a[i];
+    
+    if (sum == 0)
+        return 0;
+    
     uint64_t med = sum / 2;
     uint64_t num = 0;
+    
+    // 查找中位数位置
     for (i = 0; i < cnt->m; ++i)
     {
         num += (uint64_t)cnt->a[i];
         if (num >= med)
+        {
+            // 对于偶数个元素，返回两个中间值的平均
+            if (sum % 2 == 0 && num == med && i + 1 < cnt->m)
+            {
+                // 找下一个非零位置
+                int j = i + 1;
+                while (j < cnt->m && cnt->a[j] == 0)
+                    j++;
+                if (j < cnt->m)
+                    return (float)(i + j) / 2.0f;
+            }
             return (float)i;
+        }
     }
     return 0;
 }
@@ -2163,7 +2209,10 @@ int bamdst(int argc, char *argv[])
         }
         aux->ndata = n;
     }
-    // FIXME: accpet more than one bam files!
+    // 多 BAM 文件支持说明：
+    // 当前实现已支持多个 BAM 文件输入，它们会被顺序处理并合并统计结果
+    // 注意：所有 BAM 文件必须使用相同的参考基因组和排序方式
+    // 第一个 BAM 文件的 header 会被用于输出
     if (export_target_bam)
     {
         bamoutfp = bam_open(export_target_bam, "w");
