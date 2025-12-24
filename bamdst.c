@@ -1511,10 +1511,21 @@ float average_cnt(count32_t *cnt)
     return (float)sum / num;
 }
 
-/* JSON string builder utilities */
+// JSON 格式化输出 - 缩进级别跟踪
+static int json_indent_level = 0;
+static const char *JSON_INDENT = "  ";  // 2空格缩进
+
+static void json_newline_indent(kstring_t *s)
+{
+    kputc('\n', s);
+    for (int i = 0; i < json_indent_level; i++)
+        kputs(JSON_INDENT, s);
+}
+
 static void json_start_object(kstring_t *s)
 {
     kputc('{', s);
+    json_indent_level++;
 }
 
 static void json_end_object(kstring_t *s)
@@ -1522,6 +1533,8 @@ static void json_end_object(kstring_t *s)
     // Remove trailing comma if present
     if (s->l > 0 && s->s[s->l - 1] == ',')
         s->l--;
+    json_indent_level--;
+    json_newline_indent(s);
     kputc('}', s);
 }
 
@@ -1539,27 +1552,32 @@ static void json_end_array(kstring_t *s)
 
 static void json_key(kstring_t *s, const char *key)
 {
-    ksprintf(s, "\"%s\":", key);
+    json_newline_indent(s);
+    ksprintf(s, "\"%s\": ", key);
 }
 
 static void json_string(kstring_t *s, const char *key, const char *value)
 {
-    ksprintf(s, "\"%s\":\"%s\",", key, value);
+    json_newline_indent(s);
+    ksprintf(s, "\"%s\": \"%s\",", key, value);
 }
 
 static void json_int(kstring_t *s, const char *key, int64_t value)
 {
-    ksprintf(s, "\"%s\":%" PRId64 ",", key, value);
+    json_newline_indent(s);
+    ksprintf(s, "\"%s\": %" PRId64 ",", key, value);
 }
 
 static void json_uint(kstring_t *s, const char *key, uint64_t value)
 {
-    ksprintf(s, "\"%s\":%" PRIu64 ",", key, value);
+    json_newline_indent(s);
+    ksprintf(s, "\"%s\": %" PRIu64 ",", key, value);
 }
 
 static void json_float(kstring_t *s, const char *key, float value)
 {
-    ksprintf(s, "\"%s\":%.2f,", key, value);
+    json_newline_indent(s);
+    ksprintf(s, "\"%s\": %.2f,", key, value);
 }
 
 /* Generate JSON format coverage report */
@@ -1575,6 +1593,9 @@ int print_report_json(struct opt_aux *f, aux_t *a, bamflag_t *fs,
     }
     // 设置更大的文件缓冲区
     setvbuf(fjson, NULL, _IOFBF, WRITE_BUFFER_SIZE);
+    
+    // 重置缩进级别
+    json_indent_level = 0;
     
     kstring_t json = {0, 0, NULL};
     
