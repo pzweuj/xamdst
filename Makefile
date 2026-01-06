@@ -21,7 +21,7 @@ all:clean $(PROG)
 
 .PHONY:all clean
 
-bamdst: $(SOURCES:.c=.o)
+xamdst: $(SOURCES:.c=.o)
 		$(CC) $(CFLAGS) -o $@ $(SOURCES:.c=.o) $(INCLUDES) -lm $(HTSLIB_LIBS) -lz -lpthread
 
 clean:
