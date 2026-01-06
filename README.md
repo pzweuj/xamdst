@@ -1,6 +1,6 @@
 # xamdst -- a BAM/CRAM Depth Stat Tool
 
-This project is a hard fork of bamdst by pzweuj. It has been refactored to use HTSlib instead of the legacy samlib/bam.h, bringing support for multi-threading and CRAM format.
+This project is a hard fork of [bamdst by shiquan](https://github.com/shiquan/bamdst). It has been refactored to use HTSlib instead of the legacy samlib/bam.h, bringing support for multi-threading and CRAM format.
 
 xamdst is a lightweight tool to stat the depth coverage of target regions of BAM/CRAM/SAM file(s).
 
