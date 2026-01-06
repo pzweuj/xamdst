@@ -30,8 +30,8 @@
 #include "commons.h"
 #include "count.h"
 
-// bgzf for writing tabix-able depth.gz file (must be before htslib to avoid BGZF conflict)
-#include "bgzf.h"
+// bgzf for writing tabix-able depth.gz file
+#include <htslib/bgzf.h>
 
 // htslib for BAM/CRAM/SAM file reading
 #include <htslib/sam.h>
