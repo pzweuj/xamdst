@@ -1,8 +1,10 @@
-# bamdst -- a BAM Depth Stat Tool
+# xamdst -- a BAM/CRAM Depth Stat Tool
 
-Bamdst is a lightweight tool to stat the depth coverage of target regions of bam file(s).
+This project is a hard fork of bamdst by pzweuj. It has been refactored to use HTSlib instead of the legacy samlib/bam.h, bringing support for multi-threading and CRAM format.
 
-Bam file(s) should be properly sorted, and the probe file (bed file) and the output dir
+xamdst is a lightweight tool to stat the depth coverage of target regions of BAM/CRAM/SAM file(s).
+
+Input files should be properly sorted, and the probe file (bed file) and the output dir
 
 must be specified in the first place.
 
@@ -24,8 +26,8 @@ brew install htslib
 
 ## Install
 ```
-git clone https://github.com/pzweuj/bamdst
-cd bamdst
+git clone https://github.com/pzweuj/xamdst
+cd xamdst
 make
 ```
 
@@ -33,15 +35,15 @@ make
 
 Normal:
 
-	bamdst -p <probe.bed> -o ./ in1.bam
+	xamdst -p <probe.bed> -o ./ in1.bam
 
 With multi-threading (8 threads):
 
-	bamdst -p <probe.bed> -o ./ --threads 8 in1.bam
+	xamdst -p <probe.bed> -o ./ --threads 8 in1.bam
 
 Pipeline mode:
 
-	samtools view in1.bam -u | bamdst -p x.bed -o ./ -
+	samtools view in1.bam -u | xamdst -p x.bed -o ./ -
 
 ## PARAMETERS
 

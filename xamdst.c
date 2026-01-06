@@ -44,7 +44,7 @@
 #include "kstring.h"
 #include <sys/stat.h>
 
-static char const *program_name = "bamdst";
+static char const *program_name = "xamdst";
 static char const *Version = "2.0.0";
 
 /* flank region will be stat in the coverage report file,
@@ -521,13 +521,6 @@ Optional parameters:\n\
  - depth.tsv.gz        raw depth, rmdup depth, coverage depth of each position\n\
  - uncover.bed         the bad covered or uncovered region in the probe file\n\
 \n\
-* New features in this version:\n\
- - CRAM format support: use -T to specify reference genome\n\
- - Rmdup coverage statistics: coverage based on deduplicated depth\n\
- - Ratio-based coverage: coverage at ratios of average depth (e.g., 0.2x, 0.5x)\n\
- - JSON output: coverage.report.json for programmatic access\n\
- - Auto directory creation: output directory created if not exists\n\
-\n\
 * About depth.tsv.gz:\n\
 * There are five columns in this file, including chromosome, position, raw\n\
 * depth, rmdep depth, coverage depth\n\
@@ -541,7 +534,7 @@ Optional parameters:\n\
 ");
         puts("============\n");
         puts(" HOMEPAGE: \n\
-      https://github.com/shiquan/bamdst\n");
+      https://github.com/pzweuj/xamdst\n");
     }
     exit(EXIT_SUCCESS);
 }
@@ -2105,7 +2098,7 @@ int show_version()
     printf("%s\n", Version);
     return 1;
 }
-int bamdst(int argc, char *argv[])
+int xamdst(int argc, char *argv[])
 {
     int n, i;
     char *probe = 0;
@@ -2367,5 +2360,5 @@ freeall:
 /* main */
 int main(int argc, char *argv[])
 {
-    return bamdst(argc, argv);
+    return xamdst(argc, argv);
 }

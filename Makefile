@@ -7,8 +7,8 @@ HTSLIB_CFLAGS := $(shell pkg-config --cflags htslib 2>/dev/null || echo "")
 HTSLIB_LIBS := $(shell pkg-config --libs htslib 2>/dev/null || echo "-lhts")
 
 # Source files
-SOURCES=	bamdst.c kstring.c bedutil.c commons.c
-PROG=		bamdst
+SOURCES=	xamdst.c kstring.c bedutil.c commons.c
+PROG=		xamdst
 INCLUDES=	-I. $(HTSLIB_CFLAGS)
 
 .SUFFIXES:.c .o
