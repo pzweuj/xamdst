@@ -1,5 +1,6 @@
 /* The MIT License
 
+   Copyright (c) 2026 pzweuj - Ported to HTSlib
    Copyright (c) 2022, 2023, 2024 Authors
    Copyright (c) 2013-2014 Beijing Genomics Institution (BGI)
 
@@ -29,12 +30,15 @@
 #include "commons.h"
 #include "count.h"
 
-// bam.h and sam_header.h are standard header from samtools
-#include "bam.h"
-#include "sam_header.h"
+// htslib for BAM/CRAM/SAM file reading
+#include <htslib/sam.h>
+#include <htslib/hts.h>
+#include <htslib/faidx.h>
+
+// bgzf for writing tabix-able depth.gz file (keep local implementation)
+#include "bgzf.h"
 
 // khash, kstring and knetfile are standard utils of klib
-#include "bgzf.h" // write tabix-able depth.gz file
 #include "khash.h"
 #include "knetfile.h"
 #include "kstring.h"
@@ -105,21 +109,19 @@ void h_chrlength_init()
     h_chrlen = kh_init(chr);
 }
 
-// warp bamheader to retrieve chromosome legth hash
-void header2chrhash(bam_header_t *h)
+// warp sam header to retrieve chromosome length hash
+void header2chrhash(sam_hdr_t *h)
 {
-    int i, n, ret;
+    int i, ret;
     khiter_t k;
-    h->dict = sam_header_parse2(h->text);
-    const char *tags[] = {"SN", "LN", "UR", "M5", NULL};
-    char **tbl = sam_header2tbl_n(h->dict, "SQ", tags, &n);
-    for (i = 0; i < n; i++)
+    int n_targets = sam_hdr_nref(h);
+    for (i = 0; i < n_targets; i++)
     {
-        k = kh_put(chr, h_chrlen, strdup(tbl[4 * i]), &ret);
-        kh_val(h_chrlen, k).length = atoi(tbl[4 * i + 1]);
+        const char *name = sam_hdr_tid2name(h, i);
+        hts_pos_t len = sam_hdr_tid2len(h, i);
+        k = kh_put(chr, h_chrlen, strdup(name), &ret);
+        kh_val(h_chrlen, k).length = (uint32_t)len;
     }
-    if (tbl)
-        free(tbl);
 }
 
 void chrhash_destroy()
@@ -161,6 +163,8 @@ struct opt_aux
     int num_ratios;     // 比例数量
     int max_ratios;     // 最大比例数量
     float *ratios;      // 比例数组 (如 0.1, 0.2, 0.5)
+    // 新增：参考基因组路径（用于 CRAM 文件）
+    char *reference;    // 参考基因组 FASTA 文件路径
 };
 
 // 一个函数来初始化 opt_aux 结构体
@@ -196,6 +200,9 @@ struct opt_aux init_opt_aux()
     // 设置默认比例值 0.2 和 0.5
     opt.ratios[0] = 0.2f;
     opt.ratios[1] = 0.5f;
+    
+    // 初始化参考基因组路径
+    opt.reference = NULL;
     
     return opt;
 }
@@ -309,10 +316,10 @@ struct _aux
     uint64_t tgt_len, flk_len;
     unsigned tgt_nreg;
 
-    /* data, array of bam struct
-     * h,  point to bam header */
-    bamFile *data;
-    bam_header_t *h;
+    /* data, array of htsFile pointers for BAM/CRAM/SAM
+     * h,  point to sam header */
+    htsFile **data;
+    sam_hdr_t *h;
 
     /* h_tgt, target bed hash
      * h_flk, flank bed hash */
@@ -334,8 +341,8 @@ struct _aux *aux_init()
     struct _aux *a;
     a = calloc(1, sizeof(struct _aux));
     a->nchr = a->maxdep = a->ndata = 0;
-    a->data = NULL; // bamFile
-    a->h = NULL;    // bam header
+    a->data = NULL; // htsFile array
+    a->h = NULL;    // sam header
     a->h_tgt = kh_init(reg);
     a->h_flk = kh_init(reg);
     count32_init(a->c_dep);
@@ -357,7 +364,7 @@ void aux_destroy(struct _aux *a)
     free(a->data);
     bedHand->destroy((void *)a->h_tgt, destroy_data);
     bedHand->destroy((void *)a->h_flk, destroy_void);
-    bam_header_destroy(a->h);
+    sam_hdr_destroy(a->h);
     /* if (a->c_dep->n > 0) count_destroy(a->c_dep); */
     /* if (a->c_rmdupdep->n > 0) count_destroy(a->c_rmdupdep); */
     /* if (a->c_flkdep->n > 0) count_destroy(a->c_flkdep); */
@@ -465,17 +472,19 @@ void usage(int status)
         printf("\n\
 bamdst version: %s\n\
 USAGE : %s [OPTION] -p <probe.bed> -o <output_dir> [in1.bam [in2.bam ... ]]\n\
+   or : %s [OPTION] -p <probe.bed> -o <output_dir> [in1.cram] -T <ref.fa>\n\
    or : %s [OPTION] -p <probe.bed> -o <output_dir> -\n\
 ",
-               Version, program_name, program_name);
+               Version, program_name, program_name, program_name);
         puts("\
 Option -o and -p are mandatory:\n\
-  -o, --outdir         output dir\n\
+  -o, --outdir         output dir (will be created if not exists)\n\
   -p, --bed            probe or target regions file, the region file will \n\
                        be merged before calculate depths\n\
 ");
         puts("\
 Optional parameters:\n\
+   -T, --reference FILE  reference genome FASTA file (required for CRAM input)\n\
    -f, --flank [200]   flank n bp of each region\n\
    -q [20]             map quality cutoff value, greater or equal to the value will be count\n\
    --maxdepth [0]      set the max depth to stat the cumu distribution.\n\
@@ -489,6 +498,10 @@ Optional parameters:\n\
 \n");
 
         puts("\
+* Supported input formats: BAM, CRAM, SAM\n\
+* CRAM files require a reference genome (-T/--reference option)\n\
+* The output directory will be created automatically if it doesn't exist\n\
+\n\
 * Five essential files would be created in the output dir. \n\
 * region.tsv.gz and depth.tsv.gz are zipped by bgzip, so you can use tabix \n\
   index these files.\n\n\
@@ -503,9 +516,11 @@ Optional parameters:\n\
  - uncover.bed         the bad covered or uncovered region in the probe file\n\
 \n\
 * New features in this version:\n\
+ - CRAM format support: use -T to specify reference genome\n\
  - Rmdup coverage statistics: coverage based on deduplicated depth\n\
  - Ratio-based coverage: coverage at ratios of average depth (e.g., 0.2x, 0.5x)\n\
  - JSON output: coverage.report.json for programmatic access\n\
+ - Auto directory creation: output directory created if not exists\n\
 \n\
 * About depth.tsv.gz:\n\
 * There are five columns in this file, including chromosome, position, raw\n\
@@ -999,7 +1014,7 @@ void write_unover_file()
 int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
 {
     // get the chromosome name from header
-    bam_header_t *h = a->h;
+    sam_hdr_t *h = a->h;
     loopbams_parameters_t *para = init_loopbams_parameters();
     ksprintf(para->pdepths, "#Chr\tPos\tRaw Depth\tRmdup depth\tCover depth\n");
     ksprintf(para->rcov, "#Chr\tStart\tStop\tAvg depth\tMedian\tCoverage\tCoverage(FIX)\n");
@@ -1008,25 +1023,25 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
     int i;
     for (i = 0; i < a->ndata; ++i)
     {
-        bamFile dat = a->data[i];
+        htsFile *dat = a->data[i];
         bool goto_next_chromosome = FALSE;
         int ret;
         cntstat_t state;
         // main loop
         bam1_t *b;
-        b = (bam1_t *)needmem(sizeof(bam1_t));
+        b = bam_init1();
 
         while (1)
         {
             state = CMATCH;
-            ret = bam_read1(dat, b);
+            ret = sam_read1(dat, h, b);
             if (ret == -1)
             {
                 break; // normal end
             }
-            if (ret == -2)
+            if (ret < -1)
             {
-                errabort("%d bam file is truncated!\n", i + 1);
+                errabort("%d bam/cram file is truncated or corrupted!\n", i + 1);
             }
             bam1_core_t *c = &b->core;
             // skip secondary and supplement alignment first
@@ -1115,7 +1130,7 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
                 }
 
                 para->tid = c->tid;
-                para->name = h->target_name[c->tid];
+                para->name = (char *)sam_hdr_tid2name(h, c->tid);
 
                 // impossible in normal pratices, only happens in the different bam
                 // headers
@@ -1190,7 +1205,7 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
             // endcore:
         }
         bam_destroy1(b);
-        bgzf_close(a->data[i]);
+        hts_close(a->data[i]);
     }
     while (para->tgt_node)
     {
@@ -2058,6 +2073,7 @@ enum
     UNCOVER,
     BAMOUT,
     DEPTHRATIO,
+    REFERENCE,
     HELP
 };
 
@@ -2071,6 +2087,7 @@ static struct option const long_opts[] = {{"outdir", required_argument, NULL, 'o
                                           {"uncover", required_argument, NULL, UNCOVER},
                                           {"bamout", required_argument, NULL, BAMOUT},
                                           {"depthratio", required_argument, NULL, DEPTHRATIO},
+                                          {"reference", required_argument, NULL, 'T'},
                                           //{"rmdup", no_argument, NULL, 'd'},
                                           {"help", no_argument, NULL, 'h'},
                                           {"version", no_argument, NULL, 'v'}};
@@ -2087,7 +2104,7 @@ int bamdst(int argc, char *argv[])
 
     // struct opt_aux opt = {.inputs = NULL, .isize_lim = 2000, .mapQ_lim = 20};
     struct opt_aux opt = init_opt_aux();
-    while ((n = getopt_long(argc, argv, "o:p:f:q:l:h1v", long_opts, NULL)) >= 0)
+    while ((n = getopt_long(argc, argv, "o:p:f:q:l:T:h1v", long_opts, NULL)) >= 0)
     {
         switch (n)
         {
@@ -2161,6 +2178,10 @@ int bamdst(int argc, char *argv[])
         case 'q':
             opt.mapQ_lim = atoi(optarg);
             break;
+        case 'T':
+            // 参考基因组路径（用于 CRAM 文件）
+            opt.reference = strdup(optarg);
+            break;
         case 'h':
             usage(1);
             break;
@@ -2176,7 +2197,7 @@ int bamdst(int argc, char *argv[])
         }
     }
     if (isNull(outdir) || isNull(probe))
-        usage(0);
+        usage(1);
     if (export_target_bam && check_filename_isbam(export_target_bam))
     {
         fprintf(stderr, "--bamout must be a bam file: %s", export_target_bam);
@@ -2185,56 +2206,91 @@ int bamdst(int argc, char *argv[])
 
     n = argc - optind;
     mkdirp(outdir, 0755);
-    // capable of deals with severl bam files
+    // capable of deals with several bam/cram files
     aux_t *aux;
     aux = aux_init();
     if (isZero(n))
     {
-        aux->data = (bamFile *)needmem(sizeof(bamFile));
-        aux->data[0] = bgzf_dopen(fileno(stdin), "r");
-        aux->h = bam_header_read(aux->data[0]);
+        aux->data = (htsFile **)needmem(sizeof(htsFile *));
+        aux->data[0] = hts_open("-", "r");
+        if (aux->data[0] == NULL)
+            errabort("Failed to open stdin for reading");
+        // Set reference for CRAM if provided
+        if (opt.reference)
+        {
+            if (hts_set_fai_filename(aux->data[0], opt.reference) != 0)
+            {
+                errabort("Failed to set reference file: %s", opt.reference);
+            }
+        }
+        aux->h = sam_hdr_read(aux->data[0]);
+        if (aux->h == NULL)
+            errabort("Failed to read header from stdin");
         aux->ndata = 1;
         opt.nfiles = 0;
     }
     else
     {
-        aux->data = (bamFile *)needmem(n * sizeof(bamFile));
+        aux->data = (htsFile **)needmem(n * sizeof(htsFile *));
         opt.nfiles = n;
         opt.inputs = (char **)needmem(n * sizeof(char *));
         for (i = 0; i < n; ++i)
         {
-            bam_header_t *h_tmp;
-            // h_tmp = calloc(1, sizeof(bam_header_t));
+            sam_hdr_t *h_tmp;
             if (STREQ(argv[optind + i], "-"))
             {
-                aux->data[i] = bgzf_dopen(fileno(stdin), "r");
+                aux->data[i] = hts_open("-", "r");
                 stdin_lock = 1;
             }
             else
             {
-                aux->data[i] = bgzf_open(argv[optind + i], "r");
+                aux->data[i] = hts_open(argv[optind + i], "r");
             }
             if (aux->data[i] == NULL)
                 errabort("%s: %s", argv[optind + i], strerror(errno));
-            h_tmp = bam_header_read(aux->data[i]);
+            
+            // Check if CRAM and reference is needed
+            const htsFormat *fmt = hts_get_format(aux->data[i]);
+            if (fmt->format == cram)
+            {
+                if (opt.reference == NULL)
+                {
+                    errabort("CRAM file requires a reference genome. Use -T/--reference to specify.");
+                }
+                if (hts_set_fai_filename(aux->data[i], opt.reference) != 0)
+                {
+                    errabort("Failed to set reference file: %s", opt.reference);
+                }
+            }
+            else if (opt.reference)
+            {
+                // Also set reference for BAM if provided (useful for some operations)
+                hts_set_fai_filename(aux->data[i], opt.reference);
+            }
+            
+            h_tmp = sam_hdr_read(aux->data[i]);
+            if (h_tmp == NULL)
+                errabort("Failed to read header from %s", argv[optind + i]);
             if (i == 0)
                 aux->h = h_tmp;
             else
-                bam_header_destroy(h_tmp);
+                sam_hdr_destroy(h_tmp);
             opt.inputs[i] = strdup(argv[optind + i]);
         }
         aux->ndata = n;
     }
-    // 多 BAM 文件支持说明：
-    // 当前实现已支持多个 BAM 文件输入，它们会被顺序处理并合并统计结果
-    // 注意：所有 BAM 文件必须使用相同的参考基因组和排序方式
-    // 第一个 BAM 文件的 header 会被用于输出
+    // 多 BAM/CRAM 文件支持说明：
+    // 当前实现已支持多个 BAM/CRAM 文件输入，它们会被顺序处理并合并统计结果
+    // 注意：所有文件必须使用相同的参考基因组和排序方式
+    // 第一个文件的 header 会被用于输出
     if (export_target_bam)
     {
-        bamoutfp = bam_open(export_target_bam, "w");
+        bamoutfp = bgzf_open(export_target_bam, "w");
         if (bamoutfp == NULL)
             errabort("%s : %s", export_target_bam, strerror(errno));
-        bam_header_write(bamoutfp, aux->h);
+        // Write BAM header using htslib compatible format
+        if (bam_hdr_write(bamoutfp, aux->h) < 0)
+            errabort("Failed to write header to %s", export_target_bam);
     }
     h_chrlength_init();
     header2chrhash(aux->h);
@@ -2248,7 +2304,7 @@ int bamdst(int argc, char *argv[])
     for (i = 0; i < opt.isize_lim; ++i)
         aux->c_isize->a[i] = 0;
     // aux->c_isize->m = opt.isize_lim;
-    aux->nchr = aux->h->n_targets;
+    aux->nchr = sam_hdr_nref(aux->h);
     struct bamflag fs = {};
     load_bamfiles(&opt, aux, &fs);
     print_report(&opt, aux, &fs);
@@ -2257,9 +2313,10 @@ int bamdst(int argc, char *argv[])
         freemem(opt.inputs[i]);
     freemem(opt.inputs);
     if (export_target_bam)
-        bam_close(bamoutfp);
+        bgzf_close(bamoutfp);
     freemem(opt.cutoffs);
     freemem(opt.ratios);
+    freemem(opt.reference);
 freeall:
     freemem(export_target_bam);
     freemem(outdir);
