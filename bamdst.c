@@ -756,8 +756,8 @@ int readcore(struct depnode *header, bam1_t const *b, cntstat_t state)
     /* header = tmp; */
     if (isNull(tmp))
         return 0;
-    uint32_t *cigar = bam1_cigar(b);
-    uint32_t end = bam_calend(c, cigar);
+    uint32_t *cigar = bam_get_cigar(b);
+    uint32_t end = bam_cigar2pos(cigar);
 
     if (end >= tmp->start)
     {
@@ -1204,7 +1204,7 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
             if (para->tgt_node && readcore(para->tgt_node, b, state))
             {
                 if (export_target_bam)
-                    bam_write1(bamoutfp, b);
+                    sam_write1(bamoutfp, aux->h, b);
                 fs->n_tgt++;
             }
 

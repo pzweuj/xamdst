@@ -32,6 +32,10 @@
 #include <stdio.h>
 #include <zlib.h>
 
+/* Use htslib's BGZF if available, otherwise define our own */
+#ifdef HTS_READAHEAD_SIZE
+#include <htslib/hts.h>
+#else
 #define BGZF_BLOCK_SIZE     0x10000
 #define BGZF_MAX_BLOCK_SIZE 0x10000
 
@@ -49,6 +53,7 @@ typedef struct {
 	void *cache; // a pointer to a hash table
 	void *fp; // actual file handler; FILE* on writing; FILE* or knetFile* on reading
 } BGZF;
+#endif
 
 #ifndef KSTRING_T
 #define KSTRING_T kstring_t
