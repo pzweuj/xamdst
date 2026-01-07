@@ -31,6 +31,11 @@ cd xamdst
 make
 ```
 
+or Docker
+```
+docker pull ghcr.io/pzweuj/mapping:2026Jan
+```
+
 ## USAGE
 
 Normal:
