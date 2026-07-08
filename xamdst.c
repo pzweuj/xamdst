@@ -218,7 +218,6 @@ struct depnode
     unsigned start;
     unsigned stop;
     unsigned *vals;     // raw depth
-    unsigned *cnts;     // reads count in this position
     unsigned *rmdupdep; // clean depth, rmdup, mapQ > 20, primary hit
     unsigned *covdep;   // coverage depth
     struct depnode *next;
@@ -240,7 +239,6 @@ static const char *init_debugmsg[] = {"Success", "Trying to allocated an unempty
     } while (0)
 
 /* node->vals is the depth value of each loc
- * node->cnts is the count of covered reads
  * init the memory before use it */
 static int depnode_init(struct depnode *node)
 {
@@ -252,11 +250,9 @@ static int depnode_init(struct depnode *node)
     if (isZero(node->len))
         return 2;
     node->vals = (unsigned *)needmem((node->len) * sizeof(unsigned));
-    node->cnts = (unsigned *)needmem((node->len) * sizeof(unsigned));
     node->rmdupdep = (unsigned *)needmem((node->len) * sizeof(unsigned));
     node->covdep = (unsigned *)needmem((node->len) * sizeof(unsigned));
     memset(node->vals, 0, node->len * sizeof(unsigned));
-    memset(node->cnts, 0, node->len * sizeof(unsigned));
     memset(node->rmdupdep, 0, node->len * sizeof(unsigned));
     memset(node->covdep, 0, node->len * sizeof(unsigned));
     return 0;
@@ -271,7 +267,6 @@ static int depnode_init(struct depnode *node)
             struct depnode *tmpnode = node;                                                                            \
             node = node->next;                                                                                         \
             freemem(tmpnode->vals);                                                                                    \
-            freemem(tmpnode->cnts);                                                                                    \
             freemem(tmpnode->rmdupdep);                                                                                \
             freemem(tmpnode->covdep);                                                                                  \
             freemem(tmpnode);                                                                                          \
@@ -295,7 +290,7 @@ static struct depnode *bed_depnode_list(bedreglist_t *bed)
                            // same beg and end pos
 
         /* the length of this region should be zero if not allocated memory yet
-         *  Assign the length value when init the vals and cnts */
+         *  Assign the length value when init the vals */
         node->len = 0;
         if (isZero(i))
             header = node;
@@ -592,7 +587,9 @@ static float median_cal(const uint32_t *array, int l)
     tmp = (uint32_t *)needmem(l * sizeof(uint32_t));
     memcpy(tmp, array, l * sizeof(uint32_t));
     ks_introsort(uint32_t, l, tmp);
-    float med = l & 1 ? tmp[(l >> 1) + 1] : (float)(tmp[l >> 1] + tmp[(l >> 1) - 1]) / 2;
+    // For odd l the median is the middle element tmp[l>>1]; for even l it is
+    // the average of the two middle elements tmp[l>>1] and tmp[(l>>1)-1].
+    float med = l & 1 ? tmp[l >> 1] : (float)(tmp[l >> 1] + tmp[(l >> 1) - 1]) / 2;
     mustfree(tmp);
     return med;
 }
@@ -696,17 +693,18 @@ typedef enum
     UNKNOWN
 } cntstat_t;
 
-int match_pos(struct depnode *header, uint32_t pos, cntstat_t state)
+int match_pos(struct depnode **pp, uint32_t pos, cntstat_t state)
 {
-    struct depnode *tmp = header;
+    struct depnode *tmp = *pp;
+    /* forward-only advancement: pos grows monotonically along a read, so the
+     * node pointer only ever moves forward, avoiding a re-walk from the head
+     * on every base. */
     while (tmp && pos > tmp->stop)
-    {
         tmp = tmp->next;
-    }
+    *pp = tmp;
 
     if (isNull(tmp))
         return 1; // this chromosome is finished, skip in next loop
-    // debug("pos: %u\tstart: %u\tstop: %u", pos, tmp->start, tmp->stop);
     if (pos >= tmp->start)
     {
         if (isZero(tmp->len))
@@ -728,7 +726,7 @@ int match_pos(struct depnode *header, uint32_t pos, cntstat_t state)
         }
         return 0;
     }
-    return 1; // not reachable
+    return 1; // pos falls in a gap before this region
 }
 
 /* when deal with a read struct, check the begin of this read and the last
@@ -759,7 +757,6 @@ int readcore(struct depnode *header, bam1_t const *b, cntstat_t state)
         {
             if (isZero(tmp->len))
                 depnode_init(tmp);
-            tmp->cnts[pos - tmp->start]++;
         }
         for (i = 0; i < c->n_cigar; ++i)
         {
@@ -774,8 +771,16 @@ int readcore(struct depnode *header, bam1_t const *b, cntstat_t state)
                 continue;
             for (j = 0; j < l; ++j)
             {
+                /* once we have walked past the last region of this chromosome,
+                 * the remaining bases of the CIGAR op (and later ops) cannot
+                 * hit any region; just advance pos to stay consistent. */
+                if (tmp == NULL)
+                {
+                    pos += (l - j);
+                    break;
+                }
                 if (pos >= tmp->start)
-                    match_pos(tmp, pos, tmp_state);
+                    match_pos(&tmp, pos, tmp_state);
                 pos++;
             }
         }
@@ -856,12 +861,32 @@ int write_buffer_bgzf(kstring_t *str, BGZF *fp)
     return 0;
 }
 
+/* Append one depth.tsv.gz row: "name\tpos\traw\trmdup\tcov\n".
+ * Uses kputw/kputuw instead of ksprintf to avoid the per-call vsnprintf
+ * overhead on the hot path (one call per target position). Output is
+ * byte-identical to ksprintf("%s\t%d\t%u\t%u\t%u\n", name,pos,raw,rmdup,cov). */
+static inline void kput_depth_line(kstring_t *s, const char *name, int name_len,
+                                   int pos, unsigned raw, unsigned rmdup, unsigned cov)
+{
+    kputsn(name, name_len, s);
+    kputc('\t', s);
+    kputw(pos, s);
+    kputc('\t', s);
+    kputuw(raw, s);
+    kputc('\t', s);
+    kputuw(rmdup, s);
+    kputc('\t', s);
+    kputuw(cov, s);
+    kputc('\n', s);
+}
+
 int stat_each_region(loopbams_parameters_t *para, aux_t *a)
 {
     struct depnode *node = para->tgt_node;
     if (isNull(node))
         return 0;
     int j;
+    int name_len = para->name ? (int)strlen(para->name) : 0;
     float avg, med, cov1, cov2;
     uint32_t lst_start = 0; // uncover region start
     uint32_t lst_stop = 0;  // uncover region stop
@@ -874,8 +899,8 @@ int stat_each_region(loopbams_parameters_t *para, aux_t *a)
         cov2 = coverage_cal(node->covdep, node->len);
         for (j = 0; j < node->len; ++j)
         {
-            ksprintf(para->pdepths, "%s\t%d\t%u\t%u\t%u\n", para->name, node->start + j, node->vals[j],
-                     node->rmdupdep[j], node->covdep[j]);
+            kput_depth_line(para->pdepths, para->name, name_len, (int)(node->start + j),
+                            node->vals[j], node->rmdupdep[j], node->covdep[j]);
             // count_increase will alloc memory space automatically
             // use covdep to calculate coverage and averge depth
             count_increase(para->depvals_of_chr, node->covdep[j], uint32_t);
@@ -913,10 +938,15 @@ int stat_each_region(loopbams_parameters_t *para, aux_t *a)
     }
     else
     {
+        /* node never allocated (no read touched it): every position is zero
+         * depth. node->len == 0 here, so use the real span start..stop. This
+         * keeps depth.tsv.gz and the depth histograms consistent with regions
+         * that did receive reads. */
+        unsigned length = node->stop - node->start + 1;
         avg = med = cov1 = cov2 = 0.0;
-        for (j = 0; j < node->len; ++j)
+        for (j = 0; j < (int)length; ++j)
         {
-            ksprintf(para->pdepths, "%s\t%d\t0\t0\t0\n", para->name, node->start + j);
+            kput_depth_line(para->pdepths, para->name, name_len, (int)(node->start + j), 0, 0, 0);
         }
         // 优化：批量写入而不是每行都写
         if (para->pdepths->l > WRITE_BUFFER_SIZE)
@@ -924,8 +954,9 @@ int stat_each_region(loopbams_parameters_t *para, aux_t *a)
             write_buffer_bgzf(para->pdepths, para->fdep);
         }
         push_bedreg(para->ucreg, node->start, node->stop); // store uncover region
-        count_increaseN(para->depvals_of_chr, 0, node->len, uint32_t);
-        count_increaseN(a->c_dep, 0, node->len, uint32_t);
+        count_increaseN(para->depvals_of_chr, 0, length, uint32_t);
+        count_increaseN(a->c_dep, 0, length, uint32_t);
+        count_increaseN(a->c_rmdupdep, 0, length, uint32_t);
     }
     // ksprintf(para->pdepths,"\n");
     count_increase(a->c_reg, (int)avg, uint32_t);
@@ -968,11 +999,14 @@ int check_reachable_regions(loopbams_parameters_t *para, aux_t *a)
             ucreg_tmp = (bedreglist_t *)needmem(sizeof(bedreglist_t));
             kh_val(h_uncov, l) = *ucreg_tmp;
             para->ucreg = &kh_val(h_uncov, l);
+            mustfree(ucreg_tmp); // data already copied into the hash table
 
             while (para->tgt_node)
             {
-                int length = para->tgt_node->stop - para->tgt_node->start + 1;
-                count_increaseN(a->c_dep, 0, length, uint32_t);
+                // stat_each_region now emits depth lines and feeds c_dep /
+                // c_rmdupdep / depvals_of_chr even for never-allocated nodes,
+                // so no manual count_increaseN is needed here (it would
+                // double-count the first, already-allocated node).
                 stat_each_region(para, a);
                 del_node(para->tgt_node); // no need allocate memory for these nodes
             }
@@ -1123,7 +1157,8 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
                     stat_flk_depcnt(para, a);
                     while (para->flk_node)
                     {
-                        count_increaseN(a->c_flkdep, 0, para->flk_node->len, uint32_t);
+                        int flen = para->flk_node->stop - para->flk_node->start + 1;
+                        count_increaseN(a->c_flkdep, 0, flen, uint32_t);
                         del_node(para->flk_node);
                     }
                 }
@@ -1213,7 +1248,8 @@ int load_bamfiles(struct opt_aux *f, aux_t *a, bamflag_t *fs)
     }
     while (para->flk_node)
     {
-        count_increaseN(a->c_flkdep, 0, para->flk_node->len, uint32_t);
+        int flen = para->flk_node->stop - para->flk_node->start + 1;
+        count_increaseN(a->c_flkdep, 0, flen, uint32_t);
         del_node(para->flk_node); // no need allocate memory for these nodes
     }
     check_reachable_regions(para, a);
@@ -1311,7 +1347,9 @@ uint64_t cntcov_cal2(struct opt_aux *f, struct regcov *cov, count32_t *cnt, uint
     {
         (*data) += cnt->a[i] * i;
     }
-    uint64_t avg = (*data) / tgt_len;
+    // average depth (guard tgt_len==0 for zero-length BEDs; integer div-by-zero
+    // would crash the process)
+    uint64_t avg = tgt_len ? (*data) / tgt_len : 0;
     uint64_t avg_02 = 0.2 * avg;
     uint64_t avg_05 = 0.5 * avg;
     for (i = 0; i < cnt->m; ++i)
@@ -1487,29 +1525,31 @@ float median_cnt(count32_t *cnt)
     if (sum == 0)
         return 0;
     
-    uint64_t med = sum / 2;
+    // 1-indexed middle positions: for odd sum, (sum+1)/2 is the single middle;
+    // for even sum, sum/2 and sum/2+1 are the two middles. The depth at
+    // position p is the smallest i with cumulative count >= p.
+    uint64_t lower = (sum + 1) / 2; // lower-middle (== upper when sum is odd)
+    uint64_t upper = sum / 2 + 1;   // upper-middle
     uint64_t num = 0;
-    
-    // 查找中位数位置
+    int v1 = -1, v2 = -1;
     for (i = 0; i < cnt->m; ++i)
     {
         num += (uint64_t)cnt->a[i];
-        if (num >= med)
+        if (v1 < 0 && num >= lower)
+            v1 = i;
+        if (v2 < 0 && num >= upper)
         {
-            // 对于偶数个元素，返回两个中间值的平均
-            if (sum % 2 == 0 && num == med && i + 1 < cnt->m)
-            {
-                // 找下一个非零位置
-                int j = i + 1;
-                while (j < cnt->m && cnt->a[j] == 0)
-                    j++;
-                if (j < cnt->m)
-                    return (float)(i + j) / 2.0f;
-            }
-            return (float)i;
+            v2 = i;
+            break;
         }
     }
-    return 0;
+    if (v1 < 0)
+        v1 = cnt->m - 1; // fallback, should not happen
+    if (v2 < 0)
+        v2 = v1;
+    if (sum & 1)
+        return (float)v1;
+    return (float)(v1 + v2) / 2.0f;
 }
 
 float average_cnt(count32_t *cnt)
@@ -1522,7 +1562,7 @@ float average_cnt(count32_t *cnt)
         sum += (uint64_t)cnt->a[i] * i;
         num += (uint64_t)cnt->a[i];
     }
-    return (float)sum / num;
+    return num ? (float)sum / num : 0;
 }
 
 // JSON 格式化输出 - 缩进级别跟踪
@@ -1594,6 +1634,13 @@ static void json_float(kstring_t *s, const char *key, float value)
     ksprintf(s, "\"%s\": %.2f,", key, value);
 }
 
+/* percentage guarded against a zero denominator (empty BAM / all-unmapped /
+ * zero-length target). Returns 0.0 instead of NaN/Inf. */
+static inline float safe_pct(uint64_t num, uint64_t den)
+{
+    return den ? (float)num / (float)den * 100 : 0.0f;
+}
+
 /* Generate JSON format coverage report */
 int print_report_json(struct opt_aux *f, aux_t *a, bamflag_t *fs,
                       struct regcov *tarcov, struct regcov *flkcov, 
@@ -1633,13 +1680,13 @@ int print_report_json(struct opt_aux *f, aux_t *a, bamflag_t *fs,
     json_float(&json, "raw_data_mb", (float)fs->n_data / 1e6);
     json_uint(&json, "paired_reads", fs->n_pair_all);
     json_uint(&json, "mapped_reads", fs->n_mapped);
-    json_float(&json, "mapped_reads_fraction", (float)fs->n_mapped / fs->n_reads * 100);
+    json_float(&json, "mapped_reads_fraction", safe_pct(fs->n_mapped, fs->n_reads));
     json_float(&json, "mapped_data_mb", (float)fs->n_mdata / 1e6);
-    json_float(&json, "mapped_data_fraction", (float)fs->n_mdata / fs->n_data * 100);
+    json_float(&json, "mapped_data_fraction", safe_pct(fs->n_mdata, fs->n_data));
     json_uint(&json, "properly_paired", fs->n_pair_good);
-    json_float(&json, "properly_paired_fraction", (float)fs->n_pair_good / fs->n_reads * 100);
+    json_float(&json, "properly_paired_fraction", safe_pct(fs->n_pair_good, fs->n_reads));
     json_uint(&json, "read_mate_paired", fs->n_pair_map);
-    json_float(&json, "read_mate_paired_fraction", (float)fs->n_pair_map / fs->n_reads * 100);
+    json_float(&json, "read_mate_paired_fraction", safe_pct(fs->n_pair_map, fs->n_reads));
     json_uint(&json, "singletons", fs->n_sgltn);
     json_uint(&json, "diff_chr", fs->n_diffchr);
     json_uint(&json, "read1", fs->n_read1);
@@ -1649,11 +1696,11 @@ int print_report_json(struct opt_aux *f, aux_t *a, bamflag_t *fs,
     json_uint(&json, "forward_strand", fs->n_pstrand);
     json_uint(&json, "backward_strand", fs->n_mstrand);
     json_uint(&json, "pcr_duplicates", fs->n_dup);
-    json_float(&json, "pcr_duplicates_fraction", (float)fs->n_dup / fs->n_mapped * 100);
+    json_float(&json, "pcr_duplicates_fraction", safe_pct(fs->n_dup, fs->n_mapped));
     json_int(&json, "mapq_cutoff", f->mapQ_lim);
     json_uint(&json, "mapq_reads", fs->n_qual);
-    json_float(&json, "mapq_reads_fraction_all", (float)fs->n_qual / fs->n_reads * 100);
-    json_float(&json, "mapq_reads_fraction_mapped", (float)fs->n_qual / fs->n_mapped * 100);
+    json_float(&json, "mapq_reads_fraction_all", safe_pct(fs->n_qual, fs->n_reads));
+    json_float(&json, "mapq_reads_fraction_mapped", safe_pct(fs->n_qual, fs->n_mapped));
     json_end_object(&json);
     kputc(',', &json);
     
@@ -1669,15 +1716,15 @@ int print_report_json(struct opt_aux *f, aux_t *a, bamflag_t *fs,
     json_key(&json, "target");
     json_start_object(&json);
     json_uint(&json, "target_reads", fs->n_tgt);
-    json_float(&json, "target_reads_fraction_all", (float)fs->n_tgt / fs->n_reads * 100);
-    json_float(&json, "target_reads_fraction_mapped", (float)fs->n_tgt / fs->n_mapped * 100);
+    json_float(&json, "target_reads_fraction_all", safe_pct(fs->n_tgt, fs->n_reads));
+    json_float(&json, "target_reads_fraction_mapped", safe_pct(fs->n_tgt, fs->n_mapped));
     json_float(&json, "target_data_mb", (float)fs->n_tdata / 1e6);
     json_float(&json, "target_data_rmdup_mb", (float)fs->n_trmdat / 1e6);
-    json_float(&json, "target_data_fraction_all", (float)fs->n_tdata / fs->n_data * 100);
-    json_float(&json, "target_data_fraction_mapped", (float)fs->n_tdata / fs->n_mdata * 100);
+    json_float(&json, "target_data_fraction_all", safe_pct(fs->n_tdata, fs->n_data));
+    json_float(&json, "target_data_fraction_mapped", safe_pct(fs->n_tdata, fs->n_mdata));
     json_uint(&json, "region_length", a->tgt_len);
-    json_float(&json, "average_depth", (float)fs->n_tdata / a->tgt_len);
-    json_float(&json, "average_depth_rmdup", (float)fs->n_trmdat / a->tgt_len);
+    json_float(&json, "average_depth", (float)fs->n_tdata / (a->tgt_len ? a->tgt_len : 1));
+    json_float(&json, "average_depth_rmdup", (float)fs->n_trmdat / (a->tgt_len ? a->tgt_len : 1));
     
     // Coverage sub-object
     json_key(&json, "coverage");
@@ -1756,13 +1803,13 @@ int print_report_json(struct opt_aux *f, aux_t *a, bamflag_t *fs,
     json_start_object(&json);
     json_int(&json, "flank_size", flank_reg);
     json_uint(&json, "region_length", a->flk_len);
-    json_float(&json, "average_depth", (float)fs->n_fdata / a->flk_len);
+    json_float(&json, "average_depth", (float)fs->n_fdata / (a->flk_len ? a->flk_len : 1));
     json_uint(&json, "flank_reads", fs->n_flk);
-    json_float(&json, "flank_reads_fraction_all", (float)fs->n_flk / fs->n_reads * 100);
-    json_float(&json, "flank_reads_fraction_mapped", (float)fs->n_flk / fs->n_mapped * 100);
+    json_float(&json, "flank_reads_fraction_all", safe_pct(fs->n_flk, fs->n_reads));
+    json_float(&json, "flank_reads_fraction_mapped", safe_pct(fs->n_flk, fs->n_mapped));
     json_float(&json, "flank_data_mb", (float)fs->n_fdata / 1e6);
-    json_float(&json, "flank_data_fraction_all", (float)fs->n_fdata / fs->n_data * 100);
-    json_float(&json, "flank_data_fraction_mapped", (float)fs->n_fdata / fs->n_mdata * 100);
+    json_float(&json, "flank_data_fraction_all", safe_pct(fs->n_fdata, fs->n_data));
+    json_float(&json, "flank_data_fraction_mapped", safe_pct(fs->n_fdata, fs->n_mdata));
     json_key(&json, "coverage");
     json_start_object(&json);
     json_float(&json, "gt_0x", flkcov->cov);
@@ -1919,15 +1966,15 @@ int print_report(struct opt_aux *f, aux_t *a, bamflag_t *fs)
         fprintf(fc, "%60s\t%.2f\n", "[Total] Raw Data(Mb)", (float)fs->n_data / 1e6);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Paired Reads", fs->n_pair_all);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Mapped Reads", fs->n_mapped);
-        fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of Mapped Reads", (float)fs->n_mapped / fs->n_reads * 100);
+        fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of Mapped Reads", safe_pct(fs->n_mapped, fs->n_reads));
         fprintf(fc, "%60s\t%.2f\n", "[Total] Mapped Data(Mb)", fs->n_mdata / 1e6);
-        fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of Mapped Data(Mb)", (float)fs->n_mdata / fs->n_data * 100);
+        fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of Mapped Data(Mb)", safe_pct(fs->n_mdata, fs->n_data));
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Properly paired", fs->n_pair_good);
         fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of Properly paired",
-                (float)fs->n_pair_good / fs->n_reads * 100);
+                safe_pct(fs->n_pair_good, fs->n_reads));
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Read and mate paired", fs->n_pair_map);
         fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of Read and mate paired",
-                (float)fs->n_pair_map / fs->n_reads * 100);
+                safe_pct(fs->n_pair_map, fs->n_reads));
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Singletons", fs->n_sgltn);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Read and mate map to diff chr", fs->n_diffchr);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] Read1", fs->n_read1);
@@ -1938,31 +1985,31 @@ int print_report(struct opt_aux *f, aux_t *a, bamflag_t *fs)
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] backward strand reads", fs->n_mstrand);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] PCR duplicate reads", fs->n_dup);
         fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of PCR duplicate reads",
-                (float)fs->n_dup / fs->n_mapped * 100); // change n_reads to n_mapped, 2015/05/25
+                safe_pct(fs->n_dup, fs->n_mapped)); // change n_reads to n_mapped, 2015/05/25
         fprintf(fc, "%60s\t%d\n", "[Total] Map quality cutoff value", f->mapQ_lim);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Total] MapQuality above cutoff reads", fs->n_qual);
         fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of MapQ reads in all reads",
-                (float)fs->n_qual / fs->n_reads * 100);
+                safe_pct(fs->n_qual, fs->n_reads));
         fprintf(fc, "%60s\t%.2f%%\n", "[Total] Fraction of MapQ reads in mapped reads",
-                (float)fs->n_qual / fs->n_mapped * 100);
+                safe_pct(fs->n_qual, fs->n_mapped));
         // insert
         fprintf(fc, "%60s\t%.2f\n", "[Insert size] Average", iavg);
         fprintf(fc, "%60s\t%.ld\n", "[Insert size] Median", imed);
         // tgt
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Target] Target Reads", fs->n_tgt);
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Fraction of Target Reads in all reads",
-                (float)fs->n_tgt / fs->n_reads * 100);
+                safe_pct(fs->n_tgt, fs->n_reads));
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Fraction of Target Reads in mapped reads",
-                (float)fs->n_tgt / fs->n_mapped * 100);
+                safe_pct(fs->n_tgt, fs->n_mapped));
         fprintf(fc, "%60s\t%.2f\n", "[Target] Target Data(Mb)", (float)fs->n_tdata / 1e6);
         fprintf(fc, "%60s\t%.2f\n", "[Target] Target Data Rmdup(Mb)", (float)fs->n_trmdat / 1e6);
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Fraction of Target Data in all data",
-                (float)fs->n_tdata / fs->n_data * 100);
+                safe_pct(fs->n_tdata, fs->n_data));
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Fraction of Target Data in mapped data",
-                (float)fs->n_tdata / fs->n_mdata * 100);
+                safe_pct(fs->n_tdata, fs->n_mdata));
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[Target] Len of region", a->tgt_len);
-        fprintf(fc, "%60s\t%.2f\n", "[Target] Average depth", (float)fs->n_tdata / a->tgt_len);
-        fprintf(fc, "%60s\t%.2f\n", "[Target] Average depth(rmdup)", (float)fs->n_trmdat / a->tgt_len);
+        fprintf(fc, "%60s\t%.2f\n", "[Target] Average depth", (float)fs->n_tdata / (a->tgt_len ? a->tgt_len : 1));
+        fprintf(fc, "%60s\t%.2f\n", "[Target] Average depth(rmdup)", (float)fs->n_trmdat / (a->tgt_len ? a->tgt_len : 1));
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Coverage (>0.2*(Average depth)x)", tarcov->cov02x);
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Coverage (>0.5*(Average depth)x)", tarcov->cov05x);
         fprintf(fc, "%60s\t%.2f%%\n", "[Target] Coverage (>0x)", tarcov->cov);
@@ -2026,17 +2073,17 @@ int print_report(struct opt_aux *f, aux_t *a, bamflag_t *fs)
         // flk
         fprintf(fc, "%60s\t%u\n", "[flank] flank size", flank_reg);
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[flank] Len of region (not include target region)", a->flk_len);
-        fprintf(fc, "%60s\t%.2f\n", "[flank] Average depth", (float)fs->n_fdata / a->flk_len);
+        fprintf(fc, "%60s\t%.2f\n", "[flank] Average depth", (float)fs->n_fdata / (a->flk_len ? a->flk_len : 1));
         fprintf(fc, "%60s\t%" PRIu64 "\n", "[flank] flank Reads", fs->n_flk);
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Fraction of flank Reads in all reads",
-                (float)fs->n_flk / fs->n_reads * 100);
+                safe_pct(fs->n_flk, fs->n_reads));
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Fraction of flank Reads in mapped reads",
-                (float)fs->n_flk / fs->n_mapped * 100);
+                safe_pct(fs->n_flk, fs->n_mapped));
         fprintf(fc, "%60s\t%.2f\n", "[flank] flank Data(Mb)", (float)fs->n_fdata / 1e6);
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Fraction of flank Data in all data",
-                (float)fs->n_fdata / fs->n_data * 100);
+                safe_pct(fs->n_fdata, fs->n_data));
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Fraction of flank Data in mapped data",
-                (float)fs->n_fdata / fs->n_mdata * 100);
+                safe_pct(fs->n_fdata, fs->n_mdata));
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Coverage (>0x)", flkcov->cov);
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Coverage (>=4x)", flkcov->cov4);
         fprintf(fc, "%60s\t%.2f%%\n", "[flank] Coverage (>=10x)", flkcov->cov10);
@@ -2331,13 +2378,19 @@ int xamdst(int argc, char *argv[])
     load_bed_init(probe, aux);
     chrhash_destroy();
     freemem(probe);
-    if (aux->c_isize->n < opt.isize_lim)
+    // Pre-size the insert-size histogram so count_increase does not trigger a
+    // realloc (and a transient shrink) on the first large insert sizes. Must
+    // keep n in sync with the real allocation.
+    if (opt.isize_lim > 0 && aux->c_isize->n < (unsigned)opt.isize_lim)
     {
-        aux->c_isize->a = realloc(aux->c_isize->a, opt.isize_lim * sizeof(unsigned));
+        unsigned *isize_tmp = realloc(aux->c_isize->a, (size_t)opt.isize_lim * sizeof(unsigned));
+        if (isize_tmp == NULL)
+            errabort("out of memory while resizing insert-size histogram");
+        aux->c_isize->a = isize_tmp;
+        aux->c_isize->n = opt.isize_lim;
     }
     for (i = 0; i < opt.isize_lim; ++i)
         aux->c_isize->a[i] = 0;
-    // aux->c_isize->m = opt.isize_lim;
     aux->nchr = sam_hdr_nref(aux->h);
     struct bamflag fs = {};
     load_bamfiles(&opt, aux, &fs);

@@ -51,17 +51,21 @@ count64_t;
 
 #define count32_init(c)	do {			\
         (c) = (count32_t *)malloc(sizeof(count32_t));	\
+        if ((c) == NULL) errabort("[count32_init] out of memory"); \
         (c)->m = 0;					\
         (c)->n = 64;					\
         (c)->a = malloc(sizeof(uint32_t)*(c)->n);       \
+        if ((c)->a == NULL) errabort("[count32_init] out of memory"); \
         memset((c)->a, 0, (c)->n *sizeof(uint32_t));	\
     } while(0)
 
 #define count64_init(c)	do {			\
         (c) = (count64_t*)malloc(sizeof(count64_t));	\
+        if ((c) == NULL) errabort("[count64_init] out of memory"); \
         (c)->m = 0;					\
         (c)->n = 64;					\
         (c)->a = malloc(sizeof(uint64_t)*(c)->n);       \
+        if ((c)->a == NULL) errabort("[count64_init] out of memory"); \
         memset((c)->a, 0, (c)->n *sizeof(uint64_t));	\
     } while(0)
 
@@ -78,13 +82,17 @@ count64_t;
         if ((c)->n <= (c)->m)						\
         {                                                               \
             (c)->n = (c)->m + 1024;                                     \
-            (c)->a = realloc((c)->a, sizeof(type) * (c)->n);            \
+            type *_r = (type*)realloc((c)->a, sizeof(type) * (c)->n);   \
+            if (_r == NULL) errabort("[count_increase] out of memory"); \
+            (c)->a = _r;                                                \
             memset((c)->a + (c)->m, 0, ((c)->n-(c)->m)*sizeof(type));	\
         }                                                               \
         if((c)->n <= d+1)                                               \
         {                                                               \
             (c)->n = d+1024;                                            \
-            (c)->a = realloc((c)->a, sizeof(type) *(c)->n);             \
+            type *_r = (type*)realloc((c)->a, sizeof(type) *(c)->n);    \
+            if (_r == NULL) errabort("[count_increase] out of memory"); \
+            (c)->a = _r;                                                \
             memset((c)->a+(c)->m, 0, ((c)->n - (c)->m)*sizeof(type));	\
             (c)->m = d+1;                                               \
         }                                                               \
@@ -95,18 +103,22 @@ count64_t;
 #define count_resize(c, l, type) do {		\
  if((c)->n < l)					\
    {						\
-   (c)->a = realloc((c)->a, sizeof(type) * l);	\
+   type *_r = (type*)realloc((c)->a, sizeof(type) * l);	\
+   if (_r == NULL) errabort("[count_resize] out of memory"); \
+   (c)->a = _r;					\
    int i;					\
    for (i = (c)->n; i < l; ++i) (c)->a[i] = 0;	\
    (c)->n = l;					\
    }						\
- } while(0);
+ } while(0)
 
 #define count_increaseN(c, d, cnt, type) do {			\
         if((c)->n <= d+1)                                       \
         {                                                       \
             (c)->n = d+1024;                                    \
-            (c)->a = realloc((c)->a, sizeof(type) *(c)->n);             \
+            type *_r = (type*)realloc((c)->a, sizeof(type) *(c)->n); \
+            if (_r == NULL) errabort("[count_increaseN] out of memory"); \
+            (c)->a = _r;                                        \
             memset((c)->a+(c)->m, 0, ((c)->n - (c)->m)* sizeof(type));	\
             (c)->m = d+1;						\
         }								\
