@@ -24,6 +24,12 @@ macOS:
 brew install htslib
 ```
 
+## Recommend
+
+```
+docker pull ghcr.io/pzweuj/mapping:2026Aug
+```
+
 ## Build
 
 ```bash
