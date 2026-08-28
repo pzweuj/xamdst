@@ -37,27 +37,6 @@ If `pkg-config` cannot find HTSlib, provide its installation/source directory:
 The project does not provide a native Windows build; use Docker, WSL or a
 POSIX-compatible environment.
 
-## Automated releases
-
-Pushing a commit whose subject is exactly a semantic version such as `v0.0.1`,
-`v3.1.0`, or the pre-release form `v3.1.0-beta.1` to the default branch starts
-the release workflow. Update
-`XAMDST_VERSION` in `config.h` in that same commit; the workflow checks that the
-commit version matches `xamdst --version`. For a pre-release commit, set the
-version without the leading `v` (for example, `3.1.0-beta.1`) and GitHub marks
-the matching Release as a pre-release. For the example above, the commit must
-therefore contain `#define XAMDST_VERSION "3.1.0-beta.1"`. No manual tag is needed:
-the workflow builds and tests Linux and macOS binaries, packages each binary
-with this README and the license, and creates or updates the matching GitHub Release with
-SHA-256 checksums. GitHub creates the Release's tag at that commit as part of
-the release operation.
-
-```bash
-git add -A
-git commit -m "v3.1.0-beta.1"
-git push origin HEAD
-```
-
 ## Usage
 
 ```bash

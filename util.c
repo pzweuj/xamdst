@@ -10,12 +10,26 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
+
 static void vmessage(const char *prefix, const char *fmt, va_list ap)
 {
     fprintf(stderr, "%s: ", prefix);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
 }
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 void xwarn(const char *fmt, ...)
 {
