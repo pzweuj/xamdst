@@ -1,0 +1,4 @@
+@HD	VN:1.6	SO:coordinate
+@SQ	SN:chr1	LN:20
+conflict	99	chr1	1	60	5M	=	4	8	AAAAA	FFFFF
+conflict	147	chr1	5	60	5M	=	1	-8	CCCCC	FFFFF

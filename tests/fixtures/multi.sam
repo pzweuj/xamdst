@@ -1,0 +1,5 @@
+@HD	VN:1.6	SO:coordinate
+@SQ	SN:chr1	LN:10
+@SQ	SN:chr2	LN:10
+a	0	chr1	1	60	3M	*	0	0	AAA	FFF
+b	0	chr2	2	60	3M	*	0	0	CCC	FFF

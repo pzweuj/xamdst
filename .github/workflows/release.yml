@@ -1,0 +1,209 @@
+name: Release from version commit
+
+on:
+  push:
+    # Releases are driven by a version commit, not by a manually-created tag.
+    branches:
+      - '**'
+
+# A release for the same commit must not race a retry of that commit.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Detect release commit
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+
+    steps:
+      - name: Parse commit subject
+        id: version
+        shell: bash
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          subject="${COMMIT_MESSAGE%%$'\n'*}"
+          should_release=false
+          release_tag=
+          is_prerelease=false
+          if [ "$BRANCH_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "Ignoring version commit outside the default branch: $BRANCH_NAME"
+          elif [[ "$subject" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            should_release=true
+            release_tag="$subject"
+            if [[ "$subject" == *-* ]]; then
+              is_prerelease=true
+              echo "Pre-release commit detected: $release_tag"
+            else
+              echo "Release commit detected: $release_tag"
+            fi
+          else
+            echo "Not a release commit (subject must be vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE): $subject"
+          fi
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      IS_PRERELEASE: ${{ needs.prepare.outputs.is_prerelease }}
+      CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: macos
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v4
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "Release version must match vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE (got $RELEASE_TAG)" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libhts-dev pkg-config zlib1g-dev python3
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install htslib pkg-config
+
+      - name: Build
+        run: make
+
+      - name: Verify version and run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          actual="$(./xamdst --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "commit version $RELEASE_TAG does not match xamdst --version ($actual)" >&2
+            exit 1
+          fi
+          make test
+
+      - name: Package release assets
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          platform="${{ matrix.platform }}"
+          if [ "$platform" = macos ]; then
+            platform="macos-$(uname -m)"
+          fi
+          archive="xamdst-${version}-${platform}.tar.gz"
+          staging="$(mktemp -d)"
+          package_dir="$staging/${archive%.tar.gz}"
+          mkdir -p "$package_dir"
+          cp xamdst README.md LICENSE "$package_dir/"
+          tar -czf "$archive" -C "$staging" "$(basename "$package_dir")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    name: Create or update GitHub Release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      IS_PRERELEASE: ${{ needs.prepare.outputs.is_prerelease }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.sha256)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets were produced" >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+            tag_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type')"
+            if [ "$tag_type" = tag ]; then
+              tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
+            fi
+            if [ "$tag_object" != "$GITHUB_SHA" ]; then
+              echo "release $tag already points to $tag_object, not $GITHUB_SHA" >&2
+              exit 1
+            fi
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            if [ "$IS_PRERELEASE" = true ]; then
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --prerelease
+            fi
+          else
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+              echo "tag $tag already exists without a release; refusing to publish at another commit" >&2
+              exit 1
+            fi
+            create_args=(
+              --repo "$GITHUB_REPOSITORY"
+              --target "$GITHUB_SHA"
+              --title "xamdst $tag"
+              --generate-notes
+            )
+            if [ "$IS_PRERELEASE" = true ]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "$tag" "${assets[@]}" "${create_args[@]}"
+          fi

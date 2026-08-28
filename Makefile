@@ -1,74 +1,76 @@
-CC=		gcc
-CFLAGS=		-g -Wall -O2 -std=gnu99
-DFLAGS=		-D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
+CC ?= cc
+CPPFLAGS ?= -D_FILE_OFFSET_BITS=64 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
+CFLAGS ?= -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2
+LDFLAGS ?=
+THREAD_FLAGS ?= -pthread
 
-# Source files
-SOURCES=	xamdst.c kstring.c bedutil.c commons.c
-PROG=		xamdst
+PROG := xamdst
+SOURCES := xamdst.c config.c input.c intervals.c engine.c report.c util.c
+OBJECTS := $(SOURCES:.c=.o)
+DEPS := $(OBJECTS:.o=.d)
 
-# ---- htslib configuration ---------------------------------------------------
-# Resolution order:
-#   1. HTSLIB_DIR=<path>     explicit override (a built htslib source tree)
-#   2. system htslib         detected via pkg-config
-#   3. sibling ./htslib      local source tree -- libhts.a is auto-built if missing
-#   4. otherwise             error
-#
-# If static linking fails with "cannot find -lbz2/-llzma", your htslib was
-# built without them -- override:
-#       make HTSLIB_DEPS="-lz -lpthread -lm"
+# Prefer an installed HTSlib. HTSLIB_DIR may point at a source/build tree when
+# pkg-config is unavailable.
 HTSLIB_DIR ?=
-
-ifeq ($(HTSLIB_DIR),)
-  HAVE_PKG_HTSLIB := $(shell pkg-config --exists htslib 2>/dev/null && echo yes)
-  ifneq ($(HAVE_PKG_HTSLIB),)
-    # 2. system htslib (pkg-config)
-    HTSLIB_CFLAGS := $(shell pkg-config --cflags htslib)
-    HTSLIB_LIBS   := $(shell pkg-config --libs htslib)
-  else
-    ifneq ($(wildcard htslib/htslib/hts.h),)
-      # 3. sibling ./htslib source tree (libhts.a auto-built below)
-      HTSLIB_CFLAGS := -Ihtslib
-      HTSLIB_LIBS   := htslib/libhts.a
-      HTSLIB_DEPS   ?= -lz -lbz2 -llzma -lpthread -lm
-      HTSLIB_BUILD  := htslib/libhts.a
+ifneq ($(strip $(MAKECMDGOALS)),clean)
+  ifeq ($(strip $(HTSLIB_DIR)),)
+    HAVE_HTSLIB := $(shell pkg-config --exists htslib 2>/dev/null && echo yes)
+    ifeq ($(HAVE_HTSLIB),yes)
+      HTSLIB_CFLAGS := $(shell pkg-config --cflags htslib)
+      HTSLIB_LIBS := $(shell pkg-config --libs htslib)
     else
-      # 4. not found
-      $(error htslib not found. \
-Install htslib system-wide (then pkg-config detects it), \
-or clone it as a sibling: `git clone https://github.com/samtools/htslib htslib`, \
-or pass HTSLIB_DIR=/path/to/htslib)
+      # Some distributions ship HTSlib headers and libraries without a
+      # pkg-config file (or without pkg-config installed).  Fall back to the
+      # conventional system include/library search paths before failing.
+      HTSLIB_HEADER := $(firstword $(wildcard /usr/include/htslib/sam.h \
+                                             /usr/local/include/htslib/sam.h \
+                                             /opt/homebrew/include/htslib/sam.h \
+                                             /opt/local/include/htslib/sam.h))
+      ifeq ($(strip $(HTSLIB_HEADER)),)
+        $(error HTSlib was not found. Install HTSlib >= 1.13 or pass HTSLIB_DIR=/path/to/htslib)
+      else
+        HTSLIB_CFLAGS := -I$(patsubst %/htslib/sam.h,%,$(HTSLIB_HEADER))
+        HTSLIB_LIBS := -lhts
+      endif
     endif
+  else
+    HTSLIB_CFLAGS := -I$(HTSLIB_DIR)
+    HTSLIB_LIBS := $(HTSLIB_DIR)/libhts.a -lz -lbz2 -llzma -lpthread -lm
   endif
-else
-  # 1. explicit override
-  HTSLIB_CFLAGS := -I$(HTSLIB_DIR)
-  HTSLIB_LIBS   := $(HTSLIB_DIR)/libhts.a
-  HTSLIB_DEPS   ?= -lz -lbz2 -llzma -lpthread -lm
-  HTSLIB_BUILD  := $(HTSLIB_DIR)/libhts.a
 endif
 
-INCLUDES=	-I. $(HTSLIB_CFLAGS)
-LIBS=		$(HTSLIB_LIBS) $(HTSLIB_DEPS) -lz -lpthread -lm
+CPPFLAGS += -I. $(HTSLIB_CFLAGS)
+LDLIBS += $(HTSLIB_LIBS) -lz -lpthread -lm
 
-.SUFFIXES:.c .o
-.PHONY: all clean
+.PHONY: all clean test sanitize tsan benchmark
 
-# auto-build the local htslib (handles a git clone: autoreconf + configure + make)
-ifdef HTSLIB_BUILD
-$(HTSLIB_BUILD):
-		cd $(dir $(HTSLIB_BUILD)) && \
-		(test -f configure || autoreconf -i) && \
-		(test -f config.status || ./configure) && \
-		$(MAKE)
-endif
+all: $(PROG)
 
-.c.o:
-		$(CC) -c $(CFLAGS) $(DFLAGS) $(INCLUDES) $< -o $@
+$(PROG): $(OBJECTS)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-all:clean $(PROG)
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) -MMD -MP -c $< -o $@
 
-xamdst: $(SOURCES:.c=.o) $(HTSLIB_BUILD)
-		$(CC) $(CFLAGS) -o $@ $(SOURCES:.c=.o) $(INCLUDES) $(LIBS)
+test: $(PROG)
+	sh ./tests/run_tests.sh ./$(PROG)
+
+sanitize:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -O1 -fno-omit-frame-pointer -fsanitize=address,undefined" LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(PROG)
+	sh ./tests/run_tests.sh ./$(PROG)
+	$(MAKE) clean
+
+tsan:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -O1 -fno-omit-frame-pointer -fsanitize=thread" LDFLAGS="$(LDFLAGS) -fsanitize=thread" $(PROG)
+	sh ./tests/run_tests.sh ./$(PROG)
+	$(MAKE) clean
+
+benchmark: $(PROG)
+	sh ./tests/benchmark.sh ./$(PROG)
 
 clean:
-		rm -fr gmon.out *.o a.out *.exe *.dSYM  $(PROG) *~ *.a target.dep *.plot *.report *.tsv.gz uncover.bed
+	rm -f $(PROG) $(OBJECTS) $(DEPS)
+
+-include $(DEPS)

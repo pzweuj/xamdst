@@ -1,0 +1,66 @@
+name: xamdst
+
+on:
+  push:
+    # Release commits are built by release.yml; generated tag pushes are ignored.
+    tags-ignore:
+      - '**'
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libhts-dev samtools zlib1g-dev python3
+      - name: Build
+        run: make
+      - name: Integration tests
+        run: make test
+      - name: BAM integration
+        run: |
+          samtools view -b -o "$RUNNER_TEMP/mini.bam" tests/fixtures/mini.sam
+          out=$(mktemp -d)
+          ./xamdst -p tests/fixtures/target.bed -o "$out" --flank 2 \
+            "$RUNNER_TEMP/mini.bam"
+          python3 tests/verify_outputs.py "$out"
+      - name: CRAM integration
+        run: |
+          printf '>chr1\nAAAAAAAAAAAAAAAAAAAA\n' > "$RUNNER_TEMP/ref.fa"
+          samtools faidx "$RUNNER_TEMP/ref.fa"
+          samtools view -C -T "$RUNNER_TEMP/ref.fa" -o "$RUNNER_TEMP/mini.cram" tests/fixtures/mini.sam
+          out=$(mktemp -d)
+          ./xamdst -p tests/fixtures/target.bed -o "$out" --flank 2 \
+            --reference "$RUNNER_TEMP/ref.fa" "$RUNNER_TEMP/mini.cram"
+          python3 tests/verify_outputs.py "$out"
+      - name: GCC static analysis
+        run: |
+          make clean
+          make CFLAGS="$CFLAGS -fanalyzer"
+      - name: Sanitizer tests
+        run: make sanitize
+
+  tsan:
+    runs-on: ubuntu-latest
+    env:
+      CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libhts-dev zlib1g-dev python3
+      - name: Thread sanitizer tests
+        run: make tsan
+
+  macos:
+    runs-on: macos-latest
+    env:
+      CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install htslib pkg-config
+      - name: Build and test
+        run: make && make test

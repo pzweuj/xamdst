@@ -1,0 +1,4 @@
+@HD	VN:1.6	SO:coordinate
+@SQ	SN:chr1	LN:20
+late	0	chr1	10	60	2M	*	0	0	AA	FF
+early	0	chr1	2	60	2M	*	0	0	CC	FF
