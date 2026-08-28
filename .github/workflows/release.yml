@@ -75,7 +75,7 @@ jobs:
 
     steps:
       - name: Check out release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Validate release version
         shell: bash
@@ -94,7 +94,13 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install htslib pkg-config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if brew tap | grep -qx 'aws/tap'; then
+            brew untap --force aws/tap
+          fi
+          brew install htslib pkg-config
 
       - name: Build
         run: make
@@ -125,27 +131,36 @@ jobs:
           if [ "$platform" = macos ]; then
             platform="macos-$(uname -m)"
           fi
-          archive="xamdst-${version}-${platform}.tar.gz"
+          binary="xamdst-${version}-${platform}"
+          archive="${binary}.tar.gz"
           staging="$(mktemp -d)"
           package_dir="$staging/${archive%.tar.gz}"
           mkdir -p "$package_dir"
+          cp xamdst "$binary"
+          chmod 0755 "$binary"
           cp xamdst README.md LICENSE "$package_dir/"
           tar -czf "$archive" -C "$staging" "$(basename "$package_dir")"
           if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$binary" > "$binary.sha256"
             sha256sum "$archive" > "$archive.sha256"
           else
+            shasum -a 256 "$binary" > "$binary.sha256"
             shasum -a 256 "$archive" > "$archive.sha256"
           fi
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          echo "binary_checksum=$binary.sha256" >> "$GITHUB_OUTPUT"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
-          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
+          echo "archive_checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload release assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}
           path: |
+            ${{ steps.package.outputs.binary }}
+            ${{ steps.package.outputs.binary_checksum }}
             ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.archive_checksum }}
           if-no-files-found: error
           retention-days: 7
 
@@ -162,7 +177,7 @@ jobs:
 
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -176,11 +191,13 @@ jobs:
           set -euo pipefail
           tag="$RELEASE_TAG"
           shopt -s nullglob
-          assets=(dist/*.tar.gz dist/*.sha256)
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "No release assets were produced" >&2
+          assets=(dist/xamdst-*)
+          if [ "${#assets[@]}" -lt 8 ]; then
+            echo "Expected raw binaries, archives and checksums for two platforms; found ${#assets[@]} files" >&2
+            printf '  %s\n' "${assets[@]}" >&2
             exit 1
           fi
+          printf 'Publishing release asset: %s\n' "${assets[@]}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
             tag_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type')"

@@ -13,7 +13,7 @@ jobs:
     env:
       CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libhts-dev samtools zlib1g-dev python3
       - name: Build
@@ -48,7 +48,7 @@ jobs:
     env:
       CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libhts-dev zlib1g-dev python3
       - name: Thread sanitizer tests
@@ -59,8 +59,14 @@ jobs:
     env:
       CFLAGS: -O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
-        run: brew install htslib pkg-config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if brew tap | grep -qx 'aws/tap'; then
+            brew untap --force aws/tap
+          fi
+          brew install htslib pkg-config
       - name: Build and test
         run: make && make test
