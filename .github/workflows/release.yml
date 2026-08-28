@@ -105,7 +105,11 @@ jobs:
           set -euo pipefail
           expected="${RELEASE_TAG#v}"
           actual="$(./xamdst --version)"
-          if [ "$actual" != "$expected" ]; then
+          if [ "$actual" = "$expected" ]; then
+            :
+          elif [ "$IS_PRERELEASE" = true ] && [ "$actual" = "${expected%%-*}" ]; then
+            echo "Pre-release $RELEASE_TAG uses core binary version $actual"
+          else
             echo "commit version $RELEASE_TAG does not match xamdst --version ($actual)" >&2
             exit 1
           fi
