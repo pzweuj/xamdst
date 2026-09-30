@@ -5,7 +5,7 @@ LDFLAGS ?=
 THREAD_FLAGS ?= -pthread
 
 PROG := xamdst
-SOURCES := xamdst.c config.c input.c intervals.c engine.c report.c util.c
+SOURCES := xamdst.c config.c input.c intervals.c engine.c report.c util.c annotation.c rna_dedup.c
 OBJECTS := $(SOURCES:.c=.o)
 DEPS := $(OBJECTS:.o=.d)
 

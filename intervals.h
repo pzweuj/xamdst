@@ -61,7 +61,8 @@ int intervals_load(interval_set_t *set, const char *path, const sam_hdr_t *heade
                    int one_based, int flank);
 void intervals_destroy(interval_set_t *set);
 
-int region_ensure_buffers(depth_region_t *region, int summary_only);
+int region_ensure_buffers(depth_region_t *region, int summary_only,
+                          size_t max_region_mem);
 void regions_release_buffers(region_vec_t *regions);
 
 #endif

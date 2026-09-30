@@ -69,7 +69,8 @@ if [ -n "$baseline" ] && [ -x "$baseline" ]; then
         baseline_out="$out/baseline-$run"
         rm -rf "$baseline_out"
         /usr/bin/time -f "baseline_run=$run wall=%e user=%U sys=%S rss_kb=%M" \
-            "$baseline" -p "$bed" -o "$baseline_out" "$input" >/dev/null 2>>"$out/timing.log"
+            "$baseline" --compute-threads "$compute_threads" $summary_arg \
+            -p "$bed" -o "$baseline_out" "$input" >/dev/null 2>>"$out/timing.log"
         du -sk "$baseline_out" | awk -v run="$run" '{print "baseline_run=" run " output_kb=" $1}' >>"$out/timing.log"
     done
     baseline_median_metric() {

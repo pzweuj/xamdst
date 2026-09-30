@@ -40,13 +40,48 @@ typedef struct {
     uint64_t ambiguous;
 } fragment_stats_t;
 
+/* Sparse histogram backed by HTSlib's khash implementation. */
+typedef struct depth_histogram depth_histogram_t;
+
+/* RNA-seq mode tallies.  All counters are maintained on the serial side
+ * (main thread or the parallel reducer) and cover primary records only. */
+typedef struct {
+    uint64_t reads;
+    uint64_t bases;
+} rna_class_count_t;
+
+typedef struct {
+    /* NH selects unique/multimap; primary flags and exact read keys select records. */
+    uint64_t n_unique;          /* mapped records with NH absent or NH:i:1 */
+    uint64_t multimap_records;  /* mapped records with NH:i:>1 */
+    uint64_t n_multimap;        /* distinct multimapping reads after dedup */
+    uint64_t n_nh_missing;      /* mapped records without an NH tag */
+    uint64_t hi_missing_records;/* NH>1 records without an HI tag */
+    /* Splicing. */
+    uint64_t n_spliced;         /* unique mapped records whose CIGAR has N */
+    depth_histogram_t *intron_lengths; /* N-span lengths of unique records */
+    /* XS strand quadrants: [0]=1+-/1-+ [1]=1++/1-- [2]=2+-/2-+ [3]=2++/2-- */
+    uint64_t xs_reads;
+    uint64_t xs_quadrants[4];
+    int xs_single_end;
+    uint64_t strand_reads;
+    uint64_t strand_ambiguous;
+    uint64_t strand_quadrants[4];
+    int strand_single_end;
+    /* Annotation distribution (exonic/intronic/intergenic), filled only
+     * when --annotation is provided. */
+    rna_class_count_t exonic;
+    rna_class_count_t intronic;
+    rna_class_count_t intergenic;
+    uint64_t exon_bases;      /* union exon length over annotated chromosomes */
+    uint64_t intron_bases;    /* union intron length over annotated chromosomes */
+    uint64_t annotated_span;  /* total reference length in the BAM header */
+} rna_stats_t;
+
 typedef struct {
     uint64_t depth;
     uint64_t count;
 } histogram_pair_t;
-
-/* Sparse histogram backed by HTSlib's khash implementation. */
-typedef struct depth_histogram depth_histogram_t;
 
 depth_histogram_t *histogram_create(void);
 void histogram_destroy(depth_histogram_t *histogram);
@@ -72,6 +107,7 @@ typedef struct {
 typedef struct {
     read_stats_t reads;
     fragment_stats_t fragments;
+    rna_stats_t rna;
     /* target_data/flank_data are raw M/=/X bases in 3.1. */
     uint64_t target_data;
     uint64_t target_rmdup_data;
@@ -92,7 +128,8 @@ typedef struct {
     size_t nchromosomes;
 } analysis_result_t;
 
-void analysis_result_init(analysis_result_t *result, const interval_set_t *intervals);
+void analysis_result_init(analysis_result_t *result, const interval_set_t *intervals,
+                          const xamdst_config_t *config);
 void analysis_result_destroy(analysis_result_t *result);
 
 typedef struct {

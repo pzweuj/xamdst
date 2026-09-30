@@ -86,7 +86,7 @@ import json
 import pathlib
 import sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-assert report["schema_version"] == "3.1"
+assert report["schema_version"] == "3.2"
 assert report["depth_output"] is False
 assert not (pathlib.Path(sys.argv[2]) / "depth.tsv.gz").exists()
 PY
@@ -187,6 +187,15 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if line.strip():
         assert int(line.split("\t", 1)[0]) <= 1, line
 PY
+python3 - "$tmp/out/cumu.plot" <<'PY'
+import sys
+# Columns 4/5 use the >= d convention (mosdepth-style): the depth-1 row must
+# report all 10 target bases, the depth-2 row the 6 bases at depth >= 2.
+rows = [line.rstrip("\n").split("\t") for line in open(sys.argv[1], encoding="utf-8")
+        if line.strip()]
+assert rows[0][0] == "1" and rows[0][3] == "10", rows[0]
+assert rows[1][0] == "2" and rows[1][3] == "6", rows[1]
+PY
 quoted="$tmp/input\"quoted.sam"
 cp "$fixture/mini.sam" "$quoted"
 "$binary" -p "$fixture/target.bed" -o "$tmp/quoted" "$quoted"
@@ -206,6 +215,21 @@ if "$binary" -p "$fixture/target.bed" -o "$tmp/unsorted" "$fixture/unsorted.sam"
     echo "unsorted input unexpectedly succeeded" >&2
     exit 1
 fi
+"$binary" -p "$fixture/target.bed" -o "$tmp/placed" --flank 2 "$fixture/placed_unmapped.sam"
+python3 - "$tmp/placed/coverage.report.json" <<'PY'
+import json
+import sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+# A placed unmapped record (reference id + BAM_FUNMAP) sits between mapped
+# records in a coordinate-sorted stream and must not be mistaken for the
+# terminal unmapped block: the run succeeds and only the two mapped records
+# contribute coverage.
+assert report["total"]["raw_reads"] == 3
+assert report["total"]["mapped_reads"] == 2
+PY
+"$binary" -p "$fixture/target.bed" -o "$tmp/placed-par" --flank 2 \
+    --compute-threads 4 "$fixture/placed_unmapped.sam"
+cmp "$tmp/placed/depth.tsv.gz" "$tmp/placed-par/depth.tsv.gz"
 if "$binary" -p "$fixture/target.bed" -o "$tmp/invalid" --mapthres 256 "$fixture/mini.sam" >/dev/null 2>&1; then
     echo "invalid mapQ unexpectedly succeeded" >&2
     exit 1
@@ -235,7 +259,25 @@ if "$binary" -p "$fixture/target.bed" -o "$tmp/invalid-stdin" - - </dev/null >/d
     echo "duplicate stdin unexpectedly succeeded" >&2
     exit 1
 fi
+"$binary" -p "$fixture/target.bed" -o "$tmp/region-mem" --flank 2 \
+    --max-region-mem 1024 "$fixture/mini.sam"
+if "$binary" -p "$fixture/target.bed" -o "$tmp/invalid-region-mem" --flank 2 \
+    --max-region-mem 100 "$fixture/mini.sam" >/dev/null 2>&1; then
+    echo "undersized region memory limit unexpectedly succeeded" >&2
+    exit 1
+fi
+if "$binary" --rna --fragment-mode -p "$fixture/target.bed" -o "$tmp/invalid-rna-fragment" \
+    "$fixture/mini.sam" >/dev/null 2>&1; then
+    echo "--rna with --fragment-mode unexpectedly succeeded" >&2
+    exit 1
+fi
+if "$binary" --annotation "$fixture/mini.sam" -p "$fixture/target.bed" \
+    -o "$tmp/invalid-annotation" "$fixture/mini.sam" >/dev/null 2>&1; then
+    echo "--annotation without --rna unexpectedly succeeded" >&2
+    exit 1
+fi
 
 python3 "$root/tests/oracle.py" "$binary"
+python3 "$root/tests/rna_oracle.py" "$binary"
 
 echo "xamdst integration tests passed"

@@ -22,7 +22,11 @@ enum {
     OPT_THREADS,
     OPT_COMPUTE_THREADS,
     OPT_FRAGMENT_MODE,
-    OPT_SUMMARY_ONLY
+    OPT_SUMMARY_ONLY,
+    OPT_RNA,
+    OPT_ANNOTATION,
+    OPT_MAX_REGION_MEM,
+    OPT_RNA_DEDUP_MEM
 };
 
 static const struct option long_options[] = {
@@ -41,6 +45,10 @@ static const struct option long_options[] = {
     {"compute-threads", required_argument, NULL, OPT_COMPUTE_THREADS},
     {"fragment-mode", no_argument, NULL, OPT_FRAGMENT_MODE},
     {"summary-only", no_argument, NULL, OPT_SUMMARY_ONLY},
+    {"rna", no_argument, NULL, OPT_RNA},
+    {"annotation", required_argument, NULL, OPT_ANNOTATION},
+    {"max-region-mem", required_argument, NULL, OPT_MAX_REGION_MEM},
+    {"rna-dedup-mem", required_argument, NULL, OPT_RNA_DEDUP_MEM},
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'v'},
     {NULL, 0, NULL, 0}
@@ -65,6 +73,7 @@ void config_destroy(xamdst_config_t *config)
     free(config->outdir);
     free(config->reference);
     free(config->bamout);
+    free(config->annotation_path);
     if (config->inputs != NULL) {
         for (size_t i = 0; i < config->ninputs; ++i)
             free(config->inputs[i]);
@@ -98,12 +107,18 @@ void config_usage(const char *program, int full)
                  "      --compute-threads N coverage workers (default: 1, max: 256)\n"
                  "      --fragment-mode     remove overlapping bases of matched read pairs\n"
                  "      --summary-only      omit per-base depth.tsv.gz output\n"
+                 "      --rna               RNA-seq mode (unique-mapping depth, splicing,\n"
+                 "                          strand and annotation distribution QC)\n"
+                 "      --annotation FILE   gene annotation for --rna (GTF/GFF2, may be gzipped)\n"
+                 "      --max-region-mem N  per-region coverage buffer limit in bytes (default: 0)\n"
+                 "      --rna-dedup-mem N   RNA dedup buffer bytes (default: 67108864)\n"
                  "  -1                       input BED is 1-based inclusive\n"
                  "  -h, --help               show this help\n"
                  "  -v, --version            show version\n\n"
                  "Input files must use the same coordinate-sorted header.\n"
                  "Outputs: coverage.report, coverage.report.json, cumu.plot, insert.plot,\n"
-                 "         chromosome.report, region.tsv.gz, depth.tsv.gz, uncover.bed\n");
+                 "         chromosome.report, region.tsv.gz, depth.tsv.gz, uncover.bed\n"
+                 "         (--rna adds splice.tsv.gz and distribution.tsv)\n");
 }
 
 static int parse_long(const char *text, long min, long max, long *result, const char *name)
@@ -288,6 +303,25 @@ int config_parse(xamdst_config_t *config, int argc, char **argv)
         case OPT_SUMMARY_ONLY:
             config->summary_only = 1;
             break;
+        case OPT_RNA:
+            config->rna = 1;
+            break;
+        case OPT_ANNOTATION:
+            if (optarg == NULL || optarg[0] == '\0') {
+                xerror("--annotation requires a non-empty path");
+                return -1;
+            }
+            free(config->annotation_path);
+            config->annotation_path = xstrdup(optarg);
+            break;
+        case OPT_MAX_REGION_MEM:
+            if (parse_long(optarg, 0, LONG_MAX, &value, "max region memory")) return -1;
+            config->max_region_mem = (size_t)value;
+            break;
+        case OPT_RNA_DEDUP_MEM:
+            if (parse_long(optarg, 128, LONG_MAX, &value, "RNA dedup memory")) return -1;
+            config->rna_dedup_mem = (size_t)value;
+            break;
         case '1':
             config->one_based = 1;
             break;
@@ -320,6 +354,18 @@ int config_parse(xamdst_config_t *config, int argc, char **argv)
     }
     if (config->bamout != NULL && !has_bam_extension(config->bamout)) {
         xerror("--bamout must have a .bam extension: %s", config->bamout);
+        return -1;
+    }
+    if (config->annotation_path != NULL && !config->rna) {
+        xerror("--annotation requires --rna");
+        config_usage(program, 0);
+        return -1;
+    }
+    if (config->rna && config->fragment_mode) {
+        /* AllBestScore may produce several primary alignments per end.
+         * Fragment overlap removal currently assumes one alignment per end. */
+        xerror("--rna and --fragment-mode are mutually exclusive");
+        config_usage(program, 0);
         return -1;
     }
 

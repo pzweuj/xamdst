@@ -17,10 +17,13 @@
 #include <htslib/bgzf.h>
 #include <htslib/kstring.h>
 
-enum { OUTPUT_COUNT = 8 };
 enum { REPORT_BUFFER_SIZE = 64 * 1024 };
 
-static const char *const output_names[OUTPUT_COUNT] = {
+static void json_escaped(FILE *file, const char *text);
+static void json_uint(FILE *file, const char *key, uint64_t value, int comma);
+static void json_double(FILE *file, const char *key, double value, int comma);
+
+const char *const report_output_names[REPORT_MAX_OUTPUTS] = {
     "coverage.report",
     "coverage.report.json",
     "cumu.plot",
@@ -28,8 +31,16 @@ static const char *const output_names[OUTPUT_COUNT] = {
     "chromosome.report",
     "region.tsv.gz",
     "depth.tsv.gz",
-    "uncover.bed"
+    "uncover.bed",
+    "splice.tsv.gz",
+    "distribution.tsv"
 };
+
+size_t report_output_count(const xamdst_config_t *config)
+{
+    return (config != NULL && config->rna) ? REPORT_MAX_OUTPUTS
+                                           : REPORT_DNA_OUTPUTS;
+}
 
 static int write_bgzf(BGZF *file, const char *text, size_t length)
 {
@@ -102,19 +113,22 @@ int report_open(report_writer_t *writer, const char *outdir,
 {
     memset(writer, 0, sizeof(*writer));
     writer->depth_enabled = config == NULL || !config->summary_only;
+    /* Inactive RNA outputs participate in the transaction as removals. */
+    size_t active_outputs = report_output_count(config);
+    writer->output_count = REPORT_MAX_OUTPUTS;
     if (mkdir_p(outdir, 0755) != 0) {
         xerror("cannot create output directory '%s': %s", outdir, strerror(errno));
         return -1;
     }
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
-        writer->final_paths[i] = path_join(outdir, output_names[i]);
+    for (size_t i = 0; i < writer->output_count; ++i) {
+        writer->final_paths[i] = path_join(outdir, report_output_names[i]);
         writer->temporary_paths[i] = temporary_path(writer->final_paths[i], (unsigned)i);
         if (access(writer->temporary_paths[i], F_OK) == 0) {
             xerror("stale temporary output exists '%s'", writer->temporary_paths[i]);
             report_abort(writer);
             return -1;
         }
-        if (i == 6 && !writer->depth_enabled)
+        if (i >= active_outputs || (i == 6 && !writer->depth_enabled))
             continue;
         int fd = open(writer->temporary_paths[i], O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (fd < 0) {
@@ -132,21 +146,34 @@ int report_open(report_writer_t *writer, const char *outdir,
         }
         writer->temporary_created[i] = 1;
     }
+    int rna = config != NULL && config->rna;
     if (writer->depth_enabled)
         writer->depth = bgzf_open(writer->temporary_paths[6], "w");
     writer->region = bgzf_open(writer->temporary_paths[5], "w");
     writer->uncovered = fopen(writer->temporary_paths[7], "wb");
-    if ((writer->depth_enabled && writer->depth == NULL) || writer->region == NULL || writer->uncovered == NULL) {
+    if (rna) {
+        writer->splice = bgzf_open(writer->temporary_paths[8], "w");
+        writer->distribution = fopen(writer->temporary_paths[9], "wb");
+    }
+    if ((writer->depth_enabled && writer->depth == NULL) || writer->region == NULL ||
+        writer->uncovered == NULL ||
+        (rna && (writer->splice == NULL || writer->distribution == NULL))) {
         xerror("cannot create compressed output files in '%s'", outdir);
         report_abort(writer);
         return -1;
     }
     (void)setvbuf(writer->uncovered, NULL, _IOFBF, REPORT_BUFFER_SIZE);
+    if (rna)
+        (void)setvbuf(writer->distribution, NULL, _IOFBF, REPORT_BUFFER_SIZE);
     const char *depth_header = "#Chr\tPos\tRaw depth\tRmdup depth\tCoverage with deletions\n";
     const char *region_header = "#Chr\tStart\tStop\tRaw mean\tRaw median\tRaw coverage\tCoverage with deletions mean\tCoverage with deletions median\tCoverage with deletions coverage\n";
+    const char *splice_header = "#IntronLength\tCount\tFraction\n";
+    const char *distribution_header = "#Class\tReads\tReadFraction\tBases\tBaseFraction\tRegionBases\n";
     if ((writer->depth_enabled && write_bgzf(writer->depth, depth_header, strlen(depth_header))) ||
         write_bgzf(writer->region, region_header, strlen(region_header)) ||
-        fprintf(writer->uncovered, "#Chr\tStart\tEnd\n") < 0) {
+        fprintf(writer->uncovered, "#Chr\tStart\tEnd\n") < 0 ||
+        (rna && write_bgzf(writer->splice, splice_header, strlen(splice_header))) ||
+        (rna && fprintf(writer->distribution, "%s", distribution_header) < 0)) {
         report_abort(writer);
         return -1;
     }
@@ -210,9 +237,13 @@ static int write_plot(const char *path, const depth_histogram_t *histogram, int 
     uint64_t total = histogram_total(histogram);
     uint64_t cumulative = total;
     for (size_t i = 0; i < count; ++i) {
-        cumulative -= pairs[i].count;
-        if (maxdepth > 0 && pairs[i].depth > (uint64_t)maxdepth)
+        if (maxdepth > 0 && pairs[i].depth > (uint64_t)maxdepth) {
+            cumulative -= pairs[i].count;
             continue;
+        }
+        /* Columns 4/5 report the fraction of bases at depth >= d, matching
+         * the mosdepth convention: emit before subtracting the current bin.
+         * (Before 3.2 these columns used the > d convention.) */
         if (fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%.9f\t%" PRIu64 "\t%.9f\n",
                     pairs[i].depth, pairs[i].count, percentage(pairs[i].count, total) / 100.0,
                     cumulative, percentage(cumulative, total) / 100.0) < 0) {
@@ -220,8 +251,360 @@ static int write_plot(const char *path, const depth_histogram_t *histogram, int 
             fclose(file);
             return -1;
         }
+        cumulative -= pairs[i].count;
     }
     return close_text_file(file, path);
+}
+
+static int write_splice_histogram(BGZF *file, const depth_histogram_t *histogram)
+{
+    uint64_t total = histogram_total(histogram);
+    size_t count = 0;
+    const histogram_pair_t *pairs = histogram_sorted(histogram, &count);
+    kstring_t buffer = {0, 0, NULL};
+    for (size_t i = 0; i < count; ++i) {
+        if (ksprintf(&buffer, "%" PRIu64 "\t%" PRIu64 "\t%.6f\n",
+                     pairs[i].depth, pairs[i].count,
+                     percentage(pairs[i].count, total) / 100.0) < 0) {
+            xerror("failed to format splice output row");
+            free(buffer.s);
+            return -1;
+        }
+        if (buffer.l >= REPORT_BUFFER_SIZE && flush_buffer(file, &buffer) != 0) {
+            free(buffer.s);
+            return -1;
+        }
+    }
+    int status = flush_buffer(file, &buffer);
+    free(buffer.s);
+    return status;
+}
+
+/* distribution.tsv rows.  The RegionBases column reports the union length of
+ * each feature class over the full BAM reference dictionary; the
+ * intergenic column is derived as annotated_span minus the two unions. */
+static int write_rna_distribution(FILE *file, const xamdst_config_t *config,
+                                  const analysis_result_t *result)
+{
+    const rna_stats_t *rna = &result->rna;
+    if (config->annotation_path == NULL) {
+        if (fprintf(file, "# annotation not provided; distribution statistics skipped\n") < 0) {
+            xerror("failed to write distribution.tsv");
+            return -1;
+        }
+        return 0;
+    }
+    uint64_t total_reads;
+    uint64_t total_bases;
+    if (u64_add(rna->exonic.reads, rna->intronic.reads, &total_reads) != 0 ||
+        u64_add(total_reads, rna->intergenic.reads, &total_reads) != 0 ||
+        u64_add(rna->exonic.bases, rna->intronic.bases, &total_bases) != 0 ||
+        u64_add(total_bases, rna->intergenic.bases, &total_bases) != 0) {
+        xerror("distribution totals overflow");
+        return -1;
+    }
+    uint64_t genic;
+    if (u64_add(rna->exon_bases, rna->intron_bases, &genic) || genic > rna->annotated_span) {
+        xerror("annotation span overflow");
+        return -1;
+    }
+    uint64_t intergenic_bases = rna->annotated_span - genic;
+    const struct {
+        const char *name;
+        const rna_class_count_t *count;
+        uint64_t region_bases;
+    } rows[] = {
+        {"exonic", &rna->exonic, rna->exon_bases},
+        {"intronic", &rna->intronic, rna->intron_bases},
+        {"intergenic", &rna->intergenic, intergenic_bases},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        if (fprintf(file, "%s\t%" PRIu64 "\t%.6f\t%" PRIu64 "\t%.6f\t%" PRIu64 "\n",
+                    rows[i].name, rows[i].count->reads,
+                    percentage(rows[i].count->reads, total_reads) / 100.0,
+                    rows[i].count->bases,
+                    percentage(rows[i].count->bases, total_bases) / 100.0,
+                    rows[i].region_bases) < 0) {
+            xerror("failed to write distribution.tsv");
+            return -1;
+        }
+    }
+    if (fprintf(file, "total\t%" PRIu64 "\t%.6f\t%" PRIu64 "\t%.6f\t%" PRIu64 "\n",
+                total_reads, total_reads > 0 ? 1.0 : 0.0, total_bases,
+                total_bases > 0 ? 1.0 : 0.0, rna->annotated_span) < 0) {
+        xerror("failed to write distribution.tsv");
+        return -1;
+    }
+    return 0;
+}
+
+/* Nearest-rank quantile over the ascending histogram view, used for intron
+ * length summaries (P5/P25/P75/P95). */
+static double histogram_quantile(const depth_histogram_t *histogram, double quantile)
+{
+    uint64_t total = histogram_total(histogram);
+    if (total == 0)
+        return 0.0;
+    size_t count = 0;
+    const histogram_pair_t *pairs = histogram_sorted(histogram, &count);
+    uint64_t rank = (uint64_t)ceil(quantile * (double)total);
+    if (rank == 0)
+        rank = 1;
+    uint64_t cumulative = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (UINT64_MAX - cumulative < pairs[i].count)
+            break;
+        cumulative += pairs[i].count;
+        if (cumulative >= rank)
+            return (double)pairs[i].depth;
+    }
+    return (double)pairs[count - 1].depth;
+}
+
+/* Library strandedness inference from annotated exon quadrants, following the RSeQC
+ * infer_experiment conventions: fr-firststrand means read1 is antisense to
+ * the transcript (quadrants 1+-/1-+ and 2++/2-- dominate). */
+static const char *rna_strand_inference(const rna_stats_t *rna,
+                                        double *frac_first, double *frac_second)
+{
+    double q0 = (double)rna->strand_quadrants[0];
+    double q1 = (double)rna->strand_quadrants[1];
+    double q2 = (double)rna->strand_quadrants[2];
+    double q3 = (double)rna->strand_quadrants[3];
+    double total = q0 + q1 + q2 + q3;
+    *frac_first = 0.0;
+    *frac_second = 0.0;
+    if (total <= 0.0)
+        return "insufficient_data";
+    *frac_first = (q0 + q3) / total;
+    *frac_second = (q1 + q2) / total;
+    if (rna->strand_reads < 1000) return "insufficient_data";
+    if (*frac_first > 0.7)
+        return "fr-firststrand";
+    if (*frac_second > 0.7)
+        return "fr-secondstrand";
+    if (*frac_first >= 0.4 && *frac_first <= 0.6)
+        return "unstranded";
+    return "mixed";
+}
+
+static int write_rna_text_section(FILE *file, const xamdst_config_t *config,
+                                  const analysis_result_t *result)
+{
+    const rna_stats_t *rna = &result->rna;
+    uint64_t mapped_reads;
+    if (u64_add(rna->n_unique, rna->n_multimap, &mapped_reads)) {
+        xerror("RNA read total overflow");
+        return -1;
+    }
+    uint64_t intron_count = histogram_total(rna->intron_lengths);
+    double frac_first;
+    double frac_second;
+    const char *inference = rna_strand_inference(rna, &frac_first, &frac_second);
+    if (fprintf(file,
+                "[RNA] Enabled\ttrue\n"
+                "[RNA] Annotation\t%s\n"
+                "[RNA] Unique mapping reads\t%" PRIu64 "\n"
+                "[RNA] Unique mapping rate\t%.6f%%\n"
+                "[RNA] Multimapping records\t%" PRIu64 "\n"
+                "[RNA] Multimapping reads\t%" PRIu64 "\n"
+                "[RNA] Multimap read fraction\t%.6f%%\n"
+                "[RNA] NH-missing mapped reads\t%" PRIu64 "\n"
+                "[RNA] Spliced reads\t%" PRIu64 "\n"
+                "[RNA] Spliced read fraction\t%.6f%%\n"
+                "[RNA] Introns observed\t%" PRIu64 "\n"
+                "[RNA] Intron length mean\t%.6f\n"
+                "[RNA] Intron length median\t%.6f\n"
+                "[RNA] Intron length P5\t%.6f\n"
+                "[RNA] Intron length P25\t%.6f\n"
+                "[RNA] Intron length P75\t%.6f\n"
+                "[RNA] Intron length P95\t%.6f\n"
+                "[RNA] XS tagged reads\t%" PRIu64 "\n"
+                "[RNA] fr-firststrand fraction\t%.6f\n"
+                "[RNA] fr-secondstrand fraction\t%.6f\n"
+                "[RNA] Strand inference\t%s\n",
+                config->annotation_path != NULL ? config->annotation_path : "none",
+                rna->n_unique,
+                percentage(rna->n_unique, mapped_reads),
+                rna->multimap_records,
+                rna->n_multimap,
+                percentage(rna->n_multimap, mapped_reads),
+                rna->n_nh_missing,
+                rna->n_spliced,
+                percentage(rna->n_spliced, rna->n_unique),
+                intron_count,
+                intron_count > 0 ?
+                    (double)histogram_sum(rna->intron_lengths) / (double)intron_count : 0.0,
+                histogram_median(rna->intron_lengths),
+                histogram_quantile(rna->intron_lengths, 0.05),
+                histogram_quantile(rna->intron_lengths, 0.25),
+                histogram_quantile(rna->intron_lengths, 0.75),
+                histogram_quantile(rna->intron_lengths, 0.95),
+                rna->xs_reads,
+                frac_first,
+                frac_second,
+                inference) < 0) {
+        xerror("failed to write RNA report section");
+        return -1;
+    }
+    if (fprintf(file, "[RNA] Strand evidence\t%s\n"
+                      "[RNA] Strand effective reads\t%" PRIu64 "\n"
+                      "[RNA] Strand ambiguous reads\t%" PRIu64 "\n",
+                config->annotation_path ? "annotation_exon" : "none",
+                rna->strand_reads, rna->strand_ambiguous) < 0) return -1;
+    if (config->annotation_path == NULL)
+        return 0;
+    uint64_t dist_reads;
+    uint64_t dist_bases;
+    if (u64_add(rna->exonic.reads, rna->intronic.reads, &dist_reads) != 0 ||
+        u64_add(dist_reads, rna->intergenic.reads, &dist_reads) != 0 ||
+        u64_add(rna->exonic.bases, rna->intronic.bases, &dist_bases) != 0 ||
+        u64_add(dist_bases, rna->intergenic.bases, &dist_bases) != 0) {
+        xerror("distribution totals overflow");
+        return -1;
+    }
+    if (fprintf(file,
+                "[RNA] Exonic reads\t%" PRIu64 "\n"
+                "[RNA] Exonic read fraction\t%.6f%%\n"
+                "[RNA] Intronic reads\t%" PRIu64 "\n"
+                "[RNA] Intronic read fraction\t%.6f%%\n"
+                "[RNA] Intergenic reads\t%" PRIu64 "\n"
+                "[RNA] Intergenic read fraction\t%.6f%%\n"
+                "[RNA] Exonic bases\t%" PRIu64 "\n"
+                "[RNA] Exonic base fraction\t%.6f%%\n"
+                "[RNA] Intronic bases\t%" PRIu64 "\n"
+                "[RNA] Intronic base fraction\t%.6f%%\n"
+                "[RNA] Intergenic bases\t%" PRIu64 "\n"
+                "[RNA] Intergenic base fraction\t%.6f%%\n"
+                "[RNA] Exon union length\t%" PRIu64 "\n"
+                "[RNA] Intron union length\t%" PRIu64 "\n"
+                "[RNA] Annotated genome span\t%" PRIu64 "\n",
+                rna->exonic.reads, percentage(rna->exonic.reads, dist_reads),
+                rna->intronic.reads, percentage(rna->intronic.reads, dist_reads),
+                rna->intergenic.reads, percentage(rna->intergenic.reads, dist_reads),
+                rna->exonic.bases, percentage(rna->exonic.bases, dist_bases),
+                rna->intronic.bases, percentage(rna->intronic.bases, dist_bases),
+                rna->intergenic.bases, percentage(rna->intergenic.bases, dist_bases),
+                rna->exon_bases,
+                rna->intron_bases,
+                rna->annotated_span) < 0) {
+        xerror("failed to write RNA report section");
+        return -1;
+    }
+    return 0;
+}
+
+/* JSON "rna" object.  Emitted only in RNA mode; schema 3.2 marks it
+ * optional so DNA-mode consumers are unaffected. */
+static int write_rna_json(FILE *file, const xamdst_config_t *config,
+                           const analysis_result_t *result)
+{
+    const rna_stats_t *rna = &result->rna;
+    uint64_t mapped_reads;
+    if (u64_add(rna->n_unique, rna->n_multimap, &mapped_reads)) {
+        xerror("RNA read total overflow");
+        return -1;
+    }
+    uint64_t intron_count = histogram_total(rna->intron_lengths);
+    double frac_first;
+    double frac_second;
+    const char *inference = rna_strand_inference(rna, &frac_first, &frac_second);
+    int has_annotation = config->annotation_path != NULL;
+    uint64_t dist_reads = 0;
+    uint64_t dist_bases = 0;
+    if (has_annotation) {
+        if (u64_add(rna->exonic.reads, rna->intronic.reads, &dist_reads) != 0 ||
+            u64_add(dist_reads, rna->intergenic.reads, &dist_reads) != 0 ||
+            u64_add(rna->exonic.bases, rna->intronic.bases, &dist_bases) != 0 ||
+            u64_add(dist_bases, rna->intergenic.bases, &dist_bases) != 0) {
+            xerror("distribution totals overflow");
+            return -1;
+        }
+    }
+    fputs("  \"rna\": {\n", file);
+    fputs("    \"enabled\": true,\n", file);
+    fputs("    \"annotation\": ", file);
+    if (config->annotation_path != NULL)
+        json_escaped(file, config->annotation_path);
+    else
+        fputs("null", file);
+    fputs(",\n", file);
+    json_uint(file, "unique_mapping_reads", rna->n_unique, 1);
+    json_double(file, "unique_mapping_rate",
+                percentage(rna->n_unique, mapped_reads) / 100.0, 1);
+    json_uint(file, "multimap_records", rna->multimap_records, 1);
+    json_uint(file, "multimap_reads", rna->n_multimap, 1);
+    json_double(file, "multimap_read_fraction",
+                percentage(rna->n_multimap, mapped_reads) / 100.0, 1);
+    json_uint(file, "nh_missing_records", rna->n_nh_missing, 1);
+    json_uint(file, "spliced_reads", rna->n_spliced, 1);
+    json_double(file, "spliced_read_fraction",
+                percentage(rna->n_spliced, rna->n_unique) / 100.0, 1);
+    fputs("    \"introns\": {\n", file);
+    json_uint(file, "count", intron_count, 1);
+    json_double(file, "mean",
+                intron_count > 0 ?
+                    (double)histogram_sum(rna->intron_lengths) / (double)intron_count : 0.0, 1);
+    json_double(file, "median", histogram_median(rna->intron_lengths), 1);
+    json_double(file, "p5", histogram_quantile(rna->intron_lengths, 0.05), 1);
+    json_double(file, "p25", histogram_quantile(rna->intron_lengths, 0.25), 1);
+    json_double(file, "p75", histogram_quantile(rna->intron_lengths, 0.75), 1);
+    json_double(file, "p95", histogram_quantile(rna->intron_lengths, 0.95), 0);
+    fputs("\n    },\n    \"strand\": {\n", file);
+    fprintf(file, "    \"evidence\": \"%s\",\n", config->annotation_path ? "annotation_exon" : "none");
+    json_uint(file, "effective_reads", rna->strand_reads, 1);
+    json_uint(file, "ambiguous_reads", rna->strand_ambiguous, 1);
+    json_uint(file, "annotation_read1_antisense", rna->strand_quadrants[0], 1);
+    json_uint(file, "annotation_read1_sense", rna->strand_quadrants[1], 1);
+    json_uint(file, "annotation_read2_antisense", rna->strand_quadrants[2], 1);
+    json_uint(file, "annotation_read2_sense", rna->strand_quadrants[3], 1);
+    json_uint(file, "xs_reads", rna->xs_reads, 1);
+    json_uint(file, "q_read1_antisense", rna->xs_quadrants[0], 1);
+    json_uint(file, "q_read1_sense", rna->xs_quadrants[1], 1);
+    json_uint(file, "q_read2_antisense", rna->xs_quadrants[2], 1);
+    json_uint(file, "q_read2_sense", rna->xs_quadrants[3], 1);
+    json_double(file, "fr_firststrand_fraction", frac_first, 1);
+    json_double(file, "fr_secondstrand_fraction", frac_second, 1);
+    fprintf(file, "    \"inference\": \"%s\",\n", inference);
+    fprintf(file, "    \"single_end_observed\": %s\n",
+            rna->strand_single_end ? "true" : "false");
+    fputs("    },\n    \"distribution\": ", file);
+    if (!has_annotation) {
+        fputs("null\n", file);
+    } else {
+        fputs("{\n", file);
+        const struct {
+            const char *name;
+            const rna_class_count_t *count;
+        } classes[] = {
+            {"exonic", &rna->exonic},
+            {"intronic", &rna->intronic},
+        };
+        for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); ++i) {
+            fprintf(file, "    \"%s\": {\n", classes[i].name);
+            json_uint(file, "reads", classes[i].count->reads, 1);
+            json_double(file, "read_fraction",
+                        percentage(classes[i].count->reads, dist_reads) / 100.0, 1);
+            json_uint(file, "bases", classes[i].count->bases, 1);
+            json_double(file, "base_fraction",
+                        percentage(classes[i].count->bases, dist_bases) / 100.0, 0);
+            fputs("\n    },\n", file);
+        }
+        fputs("    \"intergenic\": {\n", file);
+        json_uint(file, "reads", rna->intergenic.reads, 1);
+        json_double(file, "read_fraction",
+                    percentage(rna->intergenic.reads, dist_reads) / 100.0, 1);
+        json_uint(file, "bases", rna->intergenic.bases, 1);
+        json_double(file, "base_fraction",
+                    percentage(rna->intergenic.bases, dist_bases) / 100.0, 0);
+        fputs("\n    },\n", file);
+        json_uint(file, "exon_bases", rna->exon_bases, 1);
+        json_uint(file, "intron_bases", rna->intron_bases, 1);
+        json_uint(file, "annotated_span", rna->annotated_span, 0);
+        fputs("\n    }\n", file);
+    }
+    fputs("  }\n", file);
+    return ferror(file) ? -1 : 0;
 }
 
 static int write_chromosome_report(const char *path, const xamdst_config_t *config,
@@ -367,7 +750,7 @@ static int write_json(const char *path, const xamdst_config_t *config,
     double average = percentage(result->target_data, result->target_bases) / 100.0;
     double average_rmdup = percentage(result->target_rmdup_data, result->target_bases) / 100.0;
     double flank_average = percentage(result->flank_data, result->flank_bases) / 100.0;
-    fprintf(file, "{\n  \"schema_version\": \"3.1\",\n  \"version\": \"%s\",\n"
+    fprintf(file, "{\n  \"schema_version\": \"3.2\",\n  \"version\": \"%s\",\n"
                  "  \"depth_output\": %s,\n  \"files\": [",
             XAMDST_VERSION, config->summary_only ? "false" : "true");
     for (size_t i = 0; i < config->ninputs; ++i) {
@@ -478,7 +861,12 @@ static int write_json(const char *path, const xamdst_config_t *config,
     json_coverage(file, "      ", result->flank_coverage_depth, result->flank_bases, config,
                   result->flank_bases ? (double)result->flank_coverage_data /
                   (double)result->flank_bases : 0.0, 0);
-    fputs("    }\n  }\n}\n", file);
+    fputs("    }\n  }", file);
+    if (config->rna) {
+        fputs(",\n", file);
+        if (write_rna_json(file, config, result)) { fclose(file); return -1; }
+    }
+    fputs("\n}\n", file);
     return close_text_file(file, path);
 }
 
@@ -663,6 +1051,10 @@ static int write_text_report(const char *path, const xamdst_config_t *config,
                 percentage(histogram_count_at_least(result->flank_coverage_depth,
                                                      (uint64_t)config->cutoffs[i]),
                            result->flank_bases));
+    if (config->rna && write_rna_text_section(file, config, result) != 0) {
+        fclose(file);
+        return -1;
+    }
     return close_text_file(file, path);
 }
 
@@ -670,10 +1062,19 @@ int report_finish(report_writer_t *writer, const xamdst_config_t *config,
                   const interval_set_t *intervals, const analysis_result_t *result)
 {
     (void)intervals;
+    int rna = config->rna;
+    if (rna) {
+        if (result->rna.n_nh_missing > 0)
+            xwarn("%" PRIu64 " mapped primary records lack NH; treated as unique for RNA depth and statistics",
+                  result->rna.n_nh_missing);
+    }
     int status = 0;
     if (writer->depth != NULL && flush_buffer(writer->depth, &writer->depth_buffer) != 0)
         status = -1;
     if (writer->region != NULL && flush_buffer(writer->region, &writer->region_buffer) != 0)
+        status = -1;
+    if (rna && writer->splice != NULL &&
+        write_splice_histogram(writer->splice, result->rna.intron_lengths) != 0)
         status = -1;
     if (writer->depth != NULL && !writer->depth_closed) {
         int close_status = bgzf_close(writer->depth);
@@ -687,18 +1088,36 @@ int report_finish(report_writer_t *writer, const xamdst_config_t *config,
         writer->region_closed = 1;
         if (close_status != 0) status = -1;
     }
+    if (writer->splice != NULL && !writer->splice_closed) {
+        int close_status = bgzf_close(writer->splice);
+        writer->splice = NULL;
+        writer->splice_closed = 1;
+        if (close_status != 0) status = -1;
+    }
     if (writer->uncovered != NULL && !writer->uncovered_closed) {
         int write_error = ferror(writer->uncovered);
         int close_error = fclose(writer->uncovered);
         if (write_error || close_error != 0) {
             xerror("failed to close uncover.bed: %s",
                    close_error != 0 ? strerror(errno) : "stream error");
-            writer->uncovered = NULL;
-            writer->uncovered_closed = 1;
             status = -1;
         }
         writer->uncovered = NULL;
         writer->uncovered_closed = 1;
+    }
+    if (writer->distribution != NULL && !writer->distribution_closed) {
+        if (status == 0 && write_rna_distribution(writer->distribution, config,
+                                                  result) != 0)
+            status = -1;
+        int write_error = ferror(writer->distribution);
+        int close_error = fclose(writer->distribution);
+        if (write_error || close_error != 0) {
+            xerror("failed to close distribution.tsv: %s",
+                   close_error != 0 ? strerror(errno) : "stream error");
+            status = -1;
+        }
+        writer->distribution = NULL;
+        writer->distribution_closed = 1;
     }
     if (status != 0)
         return -1;
@@ -713,12 +1132,12 @@ int report_finish(report_writer_t *writer, const xamdst_config_t *config,
 
 int report_commit(report_writer_t *writer)
 {
-    int moved_old[OUTPUT_COUNT] = {0};
-    int installed[OUTPUT_COUNT] = {0};
+    int moved_old[REPORT_MAX_OUTPUTS] = {0};
+    int installed[REPORT_MAX_OUTPUTS] = {0};
 
     /* Reserve backup names before moving anything.  This avoids overwriting a
      * stale backup left by an interrupted process (or a user file). */
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    for (size_t i = 0; i < writer->output_count; ++i) {
         struct stat existing;
         if (stat(writer->final_paths[i], &existing) == 0 && !S_ISREG(existing.st_mode)) {
             xerror("output path is not a regular file '%s'", writer->final_paths[i]);
@@ -728,7 +1147,7 @@ int report_commit(report_writer_t *writer)
         writer->backup_paths[i] = temporary_path(writer->final_paths[i], 10000U + (unsigned)i);
         if (access(writer->backup_paths[i], F_OK) == 0) {
             xerror("stale output backup exists '%s'", writer->backup_paths[i]);
-            for (size_t j = 0; j < OUTPUT_COUNT; ++j) {
+            for (size_t j = 0; j < writer->output_count; ++j) {
                 free(writer->backup_paths[j]);
                 writer->backup_paths[j] = NULL;
             }
@@ -740,14 +1159,14 @@ int report_commit(report_writer_t *writer)
     /* Move existing results out of the way.  If any subsequent installation
      * fails, the rollback below restores the complete previous set instead of
      * leaving a mixture of old and new reports. */
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    for (size_t i = 0; i < writer->output_count; ++i) {
         if (rename(writer->final_paths[i], writer->backup_paths[i]) == 0) {
             moved_old[i] = 1;
             writer->backup_created[i] = 1;
         } else if (errno != ENOENT) {
             xerror("cannot stage existing output '%s': %s", writer->final_paths[i],
                    strerror(errno));
-            for (size_t j = 0; j < OUTPUT_COUNT; ++j) {
+            for (size_t j = 0; j < writer->output_count; ++j) {
                 if (moved_old[j]) {
                     if (rename(writer->backup_paths[j], writer->final_paths[j]) != 0) {
                         xerror("cannot restore previous output '%s': %s", writer->final_paths[j],
@@ -761,18 +1180,18 @@ int report_commit(report_writer_t *writer)
             return -1;
         }
     }
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    for (size_t i = 0; i < writer->output_count; ++i) {
         if (writer->temporary_paths[i] == NULL || !writer->temporary_created[i])
             continue;
         if (rename(writer->temporary_paths[i], writer->final_paths[i]) != 0) {
             xerror("cannot install output '%s': %s", writer->final_paths[i], strerror(errno));
-            for (size_t j = 0; j < OUTPUT_COUNT; ++j) {
+            for (size_t j = 0; j < writer->output_count; ++j) {
                 if (installed[j])
                     (void)remove(writer->final_paths[j]);
                 else if (writer->temporary_paths[j] != NULL && writer->temporary_created[j])
                     (void)remove(writer->temporary_paths[j]);
             }
-            for (size_t j = 0; j < OUTPUT_COUNT; ++j) {
+            for (size_t j = 0; j < writer->output_count; ++j) {
                 if (moved_old[j]) {
                     if (rename(writer->backup_paths[j], writer->final_paths[j]) != 0) {
                         xerror("cannot restore previous output '%s': %s", writer->final_paths[j],
@@ -788,13 +1207,13 @@ int report_commit(report_writer_t *writer)
         installed[i] = 1;
         writer->temporary_created[i] = 0;
     }
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    for (size_t i = 0; i < writer->output_count; ++i) {
         if (moved_old[i] && remove(writer->backup_paths[i]) != 0)
             xwarn("cannot remove output backup '%s': %s", writer->backup_paths[i],
                   strerror(errno));
         writer->backup_created[i] = 0;
     }
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    for (size_t i = 0; i < writer->output_count; ++i) {
         free(writer->final_paths[i]);
         free(writer->temporary_paths[i]);
         free(writer->backup_paths[i]);
@@ -816,14 +1235,18 @@ void report_abort(report_writer_t *writer)
     if (writer->depth != NULL) bgzf_close(writer->depth);
     if (writer->region != NULL) bgzf_close(writer->region);
     if (writer->uncovered != NULL) fclose(writer->uncovered);
+    if (writer->splice != NULL) bgzf_close(writer->splice);
+    if (writer->distribution != NULL) fclose(writer->distribution);
     writer->depth = NULL;
     writer->region = NULL;
     writer->uncovered = NULL;
+    writer->splice = NULL;
+    writer->distribution = NULL;
     free(writer->depth_buffer.s);
     free(writer->region_buffer.s);
     writer->depth_buffer = (kstring_t){0, 0, NULL};
     writer->region_buffer = (kstring_t){0, 0, NULL};
-    for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    for (size_t i = 0; i < writer->output_count; ++i) {
         if (writer->temporary_paths[i] != NULL) {
             if (writer->temporary_created[i])
                 (void)remove(writer->temporary_paths[i]);

@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-#define XAMDST_VERSION "3.1.0"
+#define XAMDST_VERSION "3.2.0"
 #define XAMDST_MAX_CUSTOM 10
 #define XAMDST_MAX_COMPUTE_THREADS 256
 
@@ -12,6 +12,7 @@ typedef struct {
     char *outdir;
     char *reference;
     char *bamout;
+    char *annotation_path;
     char **inputs;
     size_t ninputs;
     int flank;
@@ -24,6 +25,9 @@ typedef struct {
     int one_based;
     int fragment_mode;
     int summary_only;
+    int rna;
+    size_t max_region_mem;
+    size_t rna_dedup_mem;
     size_t ncutoffs;
     int cutoffs[XAMDST_MAX_CUSTOM];
     size_t nratios;
