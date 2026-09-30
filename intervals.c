@@ -386,7 +386,8 @@ int intervals_load(interval_set_t *set, const char *path, const sam_hdr_t *heade
     return 0;
 }
 
-int region_ensure_buffers(depth_region_t *region, int summary_only)
+int region_ensure_buffers(depth_region_t *region, int summary_only,
+                          size_t max_region_mem)
 {
     if (region == NULL)
         return -1;
@@ -432,6 +433,24 @@ int region_ensure_buffers(depth_region_t *region, int summary_only)
             xerror("region length is too large to allocate safely");
             return -1;
         }
+    }
+
+    /* A full region costs 24 bytes per base plus a summary-only dirty
+     * bitmap, which adds up quickly for chromosome-scale intervals. Let the
+     * caller cap this so a careless BED fails fast instead of swapping. */
+    size_t bytes, dirty_bytes;
+    if (size_mul(slots, 3 * sizeof(*region->raw_diff), &bytes) ||
+        size_mul(dirty_words, sizeof(uint64_t), &dirty_bytes) ||
+        dirty_bytes > SIZE_MAX - bytes) {
+        xerror("region buffer size overflow");
+        return -1;
+    }
+    bytes += dirty_bytes;
+    if (max_region_mem != 0 && bytes > max_region_mem) {
+        xerror("region of %llu bp needs %zu bytes of coverage buffers, above "
+               "--max-region-mem %zu",
+               (unsigned long long)region->length, bytes, max_region_mem);
+        return -1;
     }
 
     int64_t *raw = xcalloc(slots, sizeof(*raw));

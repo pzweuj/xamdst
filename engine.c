@@ -1,14 +1,29 @@
 #include "engine.h"
 
 #include "util.h"
+#include "annotation.h"
+#include "rna_dedup.h"
 
 #include <inttypes.h>
+#include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 
 #include <htslib/khash.h>
+
+/* Keep optional RNA/fragment work out of the default per-record path, while
+ * allowing shared counter/finish helpers to optimize like the former single
+ * DNA loop. Measurements are recorded under docs/validation. */
+#if defined(__GNUC__) || defined(__clang__)
+#define XAMDST_HOT_INLINE static inline __attribute__((always_inline))
+#define XAMDST_NOINLINE __attribute__((noinline))
+#else
+#define XAMDST_HOT_INLINE static inline
+#define XAMDST_NOINLINE
+#endif
 
 KHASH_MAP_INIT_INT64(xamdst_depth, uint64_t)
 
@@ -241,7 +256,8 @@ double histogram_median(const depth_histogram_t *histogram)
     return ((double)lower_value + (double)upper_value) / 2.0;
 }
 
-void analysis_result_init(analysis_result_t *result, const interval_set_t *intervals)
+void analysis_result_init(analysis_result_t *result, const interval_set_t *intervals,
+                          const xamdst_config_t *config)
 {
     memset(result, 0, sizeof(*result));
     result->target_bases = intervals->target_bases;
@@ -254,6 +270,8 @@ void analysis_result_init(analysis_result_t *result, const interval_set_t *inter
     result->flank_coverage_depth = histogram_create();
     result->insert_sizes = histogram_create();
     result->region_means = histogram_create();
+    if (config != NULL && config->rna)
+        result->rna.intron_lengths = histogram_create();
     result->nchromosomes = intervals->nchromosomes;
     result->chromosomes = xcalloc(result->nchromosomes == 0 ? 1 : result->nchromosomes,
                                   sizeof(*result->chromosomes));
@@ -290,6 +308,7 @@ void analysis_result_destroy(analysis_result_t *result)
     histogram_destroy(result->flank_coverage_depth);
     histogram_destroy(result->insert_sizes);
     histogram_destroy(result->region_means);
+    histogram_destroy(result->rna.intron_lengths);
     for (size_t i = 0; i < result->nchromosomes; ++i) {
         free(result->chromosomes[i].name);
         histogram_destroy(result->chromosomes[i].depth);
@@ -324,10 +343,12 @@ static int read_next(stream_cursor_t *cursor, sam_hdr_t *header)
     }
     int tid = cursor->record->core.tid;
     hts_pos_t pos = cursor->record->core.pos;
-    int unmapped = tid < 0 || (cursor->record->core.flag & BAM_FUNMAP) != 0;
-    /* Coordinate-sorted streams may contain a terminal unmapped block.  Keep
-     * the rule independent of whether an unmapped SAM record happens to carry
-     * a reference id, so a mapped record can never follow that block. */
+    /* Only records without a reference id form the terminal unmapped block.
+     * Placed unmapped records (reference id present, BAM_FUNMAP set) are
+     * interleaved with mapped records by coordinate-aware sorters such as
+     * samtools sort, so they must take part in the coordinate order check
+     * instead of being treated as part of the terminal block. */
+    int unmapped = tid < 0;
     int out_of_order = cursor->saw_record &&
         ((!unmapped && cursor->last_unmapped) ||
          (!unmapped && !cursor->last_unmapped &&
@@ -349,8 +370,11 @@ static int cursor_before(const stream_cursor_t *a, const stream_cursor_t *b)
 {
     const bam1_core_t *ca = &a->record->core;
     const bam1_core_t *cb = &b->record->core;
-    int a_unmapped = ca->tid < 0 || (ca->flag & BAM_FUNMAP) != 0;
-    int b_unmapped = cb->tid < 0 || (cb->flag & BAM_FUNMAP) != 0;
+    /* Keep the merge order consistent with read_next(): only records without
+     * a reference id sink to the terminal unmapped block, while placed
+     * unmapped records merge by their coordinates. */
+    int a_unmapped = ca->tid < 0;
+    int b_unmapped = cb->tid < 0;
     if (a_unmapped != b_unmapped)
         return !a_unmapped;
     if (ca->tid != cb->tid)
@@ -446,7 +470,7 @@ static int add_counter(uint64_t *counter, uint64_t amount, const char *name)
  * by the unified target/flank window walk below. */
 static int update_region_delta(depth_region_t *region, uint64_t start, uint64_t end,
                                int raw_delta, int rmdup_delta, int cov_delta,
-                               int summary_only)
+                               int summary_only, size_t max_region_mem)
 {
     if (region == NULL || start >= end)
         return 0;
@@ -456,7 +480,7 @@ static int update_region_delta(depth_region_t *region, uint64_t start, uint64_t 
         return 0;
     size_t left = (size_t)(overlap_start - region->start);
     size_t right = (size_t)(overlap_end - region->start);
-    if (region_ensure_buffers(region, summary_only) != 0)
+    if (region_ensure_buffers(region, summary_only, max_region_mem) != 0)
         return -1;
     if (raw_delta != 0) {
         add_diff(region->raw_diff, left, raw_delta);
@@ -489,7 +513,7 @@ static int update_region_delta(depth_region_t *region, uint64_t start, uint64_t 
 static int update_chromosome_delta(chromosome_intervals_t *chromosome,
                                    uint64_t start, uint64_t end,
                                    int raw_delta, int rmdup_delta, int cov_delta,
-                                   int summary_only)
+                                   int summary_only, size_t max_region_mem)
 {
     if (chromosome == NULL || start >= end || chromosome->nwindows == 0)
         return 0;
@@ -509,7 +533,7 @@ static int update_chromosome_delta(chromosome_intervals_t *chromosome,
             break;
         int result = update_region_delta(window->region, start, end,
                                          raw_delta, rmdup_delta, cov_delta,
-                                         summary_only);
+                                         summary_only, max_region_mem);
         if (result < 0)
             return -1;
         if (result > 0)
@@ -545,7 +569,38 @@ typedef struct {
     fragment_pending_t *pending;
     size_t npending;
     size_t pending_capacity;
+    rna_dedup_t *dedup;
+    annotation_t *annotation;
 } run_context_t;
+
+static int rna_context_init(run_context_t *context, const sam_hdr_t *header)
+{
+    if (!context->config->rna) return 0;
+    if (context->config->annotation_path != NULL &&
+        annotation_load(&context->annotation, context->config->annotation_path, header))
+        return -1;
+    context->result->rna.exon_bases = annotation_exon_bases(context->annotation);
+    context->result->rna.intron_bases = annotation_intron_bases(context->annotation);
+    context->result->rna.annotated_span = annotation_span_bases(context->annotation);
+    context->dedup = rna_dedup_create(context->config->outdir,
+        context->config->rna_dedup_mem ? context->config->rna_dedup_mem : 64U*1024U*1024U);
+    if (context->dedup == NULL) {
+        annotation_destroy(context->annotation);
+        context->annotation = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int rna_context_finish(run_context_t *context, int error)
+{
+    if (!error && context->dedup &&
+        rna_dedup_finish(context->dedup, &context->result->rna.n_multimap))
+        error = 1;
+    rna_dedup_destroy(context->dedup);
+    annotation_destroy(context->annotation);
+    return error;
+}
 
 static int checked_sum_product(uint64_t *sum, uint64_t value, uint64_t count,
                                const char *what)
@@ -1004,6 +1059,51 @@ static const char *record_rg(const bam1_t *record)
     return value != NULL ? bam_aux2Z(value) : NULL;
 }
 
+/* Missing and malformed integer tags are distinct: -1 and -2. */
+static int64_t record_aux_int(const bam1_t *record, const char tag[2])
+{
+    errno = 0;
+    uint8_t *value = bam_aux_get(record, tag);
+    if (value == NULL)
+        return errno == EINVAL ? -2 : -1;
+    char type = (char)*value;
+    if (type != 'c' && type != 'C' && type != 's' && type != 'S' &&
+        type != 'i' && type != 'I')
+        return -2;
+    int64_t number = bam_aux2i(value);
+    return number > 0 ? number : -2;
+}
+
+/* Strand tag produced by STAR (--outSAMstrandField intronMotif).  Returns
+ * '+', '-', or 0 when absent/invalid. */
+static char record_xs(const bam1_t *record)
+{
+    uint8_t *value = bam_aux_get(record, "XS");
+    if (value == NULL || *value != 'A')
+        return 0;
+    char c = bam_aux2A(value);
+    return (c == '+' || c == '-') ? c : 0;
+}
+
+/* RNA-mode uniqueness: a record counts as uniquely mapped when it carries no
+ * NH tag (DNA aligners such as BWA) or NH:i:1.  Always true outside RNA
+ * mode, so callers can use it unconditionally.  The record must already have
+ * passed the structural CIGAR truncation checks before this reads the aux
+ * area. */
+static int record_unique(const xamdst_config_t *config, const bam1_t *record)
+{
+    if (!config->rna)
+        return 1;
+    int64_t nh = record_aux_int(record, "NH");
+    int64_t hi = record_aux_int(record, "HI");
+    if (nh == -2 || hi == -2 || (nh > 0 && hi > nh)) {
+        xerror("invalid NH/HI tag on read '%s' (positive integer tags and HI <= NH required)",
+               bam_get_qname(record));
+        return -1;
+    }
+    return nh == -1 || nh == 1;
+}
+
 static int validate_qname(const bam1_t *record, const char *chromosome)
 {
     if (record->core.l_qname == 0 || record->data == NULL || record->l_data < 0 ||
@@ -1012,6 +1112,140 @@ static int validate_qname(const bam1_t *record, const char *chromosome)
         xerror("mapped record on %s has an invalid query name", chromosome);
         return -1;
     }
+    return 0;
+}
+
+/* ---- Shared CIGAR walk ----
+ * The serial path (process_alignment) and the parallel worker path
+ * (prepare_alignment_event) used to carry near-identical copies of the
+ * CIGAR validation loop.  walk_cigar() is the single implementation: it
+ * validates the CIGAR, reports every M/=/X/D reference span through the
+ * caller-supplied handler, and optionally collects the spans for consumers
+ * that need them after the walk (fragment overlap accounting, RNA region
+ * assignment).  BAM_CREF_SKIP (N) never produces a span; it only advances
+ * the reference position and is recorded in walk->has_n/n_introns. */
+typedef struct {
+    fragment_segment_t *spans;
+    size_t nspans;
+    size_t capacity;
+    uint32_t n_introns;
+    int has_n;
+} cigar_walk_t;
+
+typedef int (*cigar_span_handler)(void *ctx, uint64_t start, uint64_t end,
+                                  unsigned kind);
+
+static inline int walk_cigar(const chromosome_intervals_t *chromosome,
+                      const bam1_t *record, int collect,
+                      cigar_span_handler handler, void *handler_ctx,
+                      cigar_walk_t *walk)
+{
+    const bam1_core_t *core = &record->core;
+    uint32_t *cigar = bam_get_cigar(record);
+    uint64_t reference_position = (uint64_t)core->pos;
+    uint64_t query_position = 0;
+    memset(walk, 0, sizeof(*walk));
+    for (uint32_t i = 0; i < core->n_cigar; ++i) {
+        int op = bam_cigar_op(cigar[i]);
+        uint32_t length = bam_cigar_oplen(cigar[i]);
+        if (length == 0) {
+            xerror("mapped record on %s contains a zero-length CIGAR operation",
+                   chromosome->name);
+            goto fail;
+        }
+        int consumes_query = (op == BAM_CMATCH || op == BAM_CINS ||
+                              op == BAM_CSOFT_CLIP || op == BAM_CEQUAL ||
+                              op == BAM_CDIFF);
+        if (consumes_query) {
+            if ((uint64_t)length > UINT64_MAX - query_position ||
+                query_position + (uint64_t)length > (uint64_t)core->l_qseq) {
+                xerror("CIGAR query length exceeds sequence length on %s",
+                       chromosome->name);
+                goto fail;
+            }
+            query_position += (uint64_t)length;
+        }
+        int consumes_reference = (op == BAM_CMATCH || op == BAM_CEQUAL ||
+                                  op == BAM_CDIFF || op == BAM_CDEL ||
+                                  op == BAM_CREF_SKIP);
+        if (consumes_reference) {
+            if ((uint64_t)length > UINT64_MAX - reference_position) {
+                xerror("CIGAR reference position overflow");
+                goto fail;
+            }
+            uint64_t end = reference_position + (uint64_t)length;
+            if (end > chromosome->length) {
+                xerror("CIGAR of record on %s extends beyond chromosome length",
+                       chromosome->name);
+                goto fail;
+            }
+            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF ||
+                op == BAM_CDEL) {
+                unsigned kind = (op == BAM_CDEL) ? 2U : 3U;
+                if (handler != NULL &&
+                    handler(handler_ctx, reference_position, end, kind) != 0)
+                    goto fail;
+                if (collect &&
+                    fragment_add_segment(&walk->spans, &walk->nspans,
+                                         &walk->capacity, reference_position,
+                                         end, kind) != 0)
+                    goto fail;
+            } else {
+                /* BAM_CREF_SKIP: introns advance the reference position
+                 * without contributing depth. */
+                walk->has_n = 1;
+                ++walk->n_introns;
+            }
+            reference_position = end;
+        } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP ||
+                   op == BAM_CHARD_CLIP || op == BAM_CPAD) {
+            /* These operations do not advance the reference position. */
+        } else {
+            xerror("unsupported CIGAR operation %d", op);
+            goto fail;
+        }
+    }
+    if (query_position != (uint64_t)core->l_qseq) {
+        xerror("CIGAR query length does not match sequence length on %s",
+               chromosome->name);
+        goto fail;
+    }
+    return 0;
+fail:
+    free(walk->spans);
+    memset(walk, 0, sizeof(*walk));
+    return -1;
+}
+
+/* Serial-path span handler: apply each span to the coverage windows
+ * immediately and remember target/flank hits.  In RNA mode the handler is
+ * disabled for multimapping records so only uniquely mapped records
+ * contribute depth. */
+typedef struct {
+    chromosome_intervals_t *chromosome;
+    int clean;
+    int summary_only;
+    size_t max_region_mem;
+    int depth_enabled;
+    int target_hit;
+    int flank_hit;
+} direct_span_ctx_t;
+
+static inline int direct_span_handler(void *opaque, uint64_t start, uint64_t end,
+                               unsigned kind)
+{
+    direct_span_ctx_t *ctx = (direct_span_ctx_t *)opaque;
+    if (!ctx->depth_enabled)
+        return 0;
+    int hit = update_chromosome_delta(ctx->chromosome, start, end,
+                                      (kind & 1U) != 0 ? 1 : 0,
+                                      (kind & 1U) != 0 && ctx->clean ? 1 : 0,
+                                      (kind & 2U) != 0 ? 1 : 0,
+                                      ctx->summary_only, ctx->max_region_mem);
+    if (hit < 0)
+        return -1;
+    ctx->target_hit |= (hit & 1) != 0;
+    ctx->flank_hit |= (hit & 2) != 0;
     return 0;
 }
 
@@ -1054,7 +1288,8 @@ static int fragment_subtract(run_context_t *context, const fragment_pending_t *p
                                         start, end, raw ? -1 : 0,
                                         raw && pending->clean && clean ? -1 : 0,
                                         coverage ? -1 : 0,
-                                        context->config->summary_only) < 0)
+                                        context->config->summary_only,
+                                        context->config->max_region_mem) < 0)
                 return -1;
             clipped = 1;
         }
@@ -1066,7 +1301,7 @@ static int fragment_subtract(run_context_t *context, const fragment_pending_t *p
     return 0;
 }
 
-static int fragment_maybe_store(run_context_t *context, size_t input_index,
+static XAMDST_NOINLINE int fragment_maybe_store(run_context_t *context, size_t input_index,
                                 const bam1_core_t *core, const char *qname,
                                 const char *rg, int clean,
                                 fragment_segment_t *segments, size_t nsegments)
@@ -1145,6 +1380,233 @@ static int fragment_maybe_store(run_context_t *context, size_t input_index,
     return 1; /* ownership of segments moved to the pending cache */
 }
 
+/* Per-record read-level accounting shared by the serial and parallel paths.
+ * All counters live in result->reads and are only ever touched from the
+ * serial side (the main thread or the parallel reducer), so no locking is
+ * required.  The profile outputs let the caller reuse the mapped/clean
+ * decisions without recomputing them. */
+typedef struct {
+    int mapped;
+    int clean;
+} record_profile_t;
+
+XAMDST_HOT_INLINE int count_read_stats(run_context_t *context, const bam1_t *record,
+                            record_profile_t *profile)
+{
+    bam1_core_t const *core = &record->core;
+    read_stats_t *stats = &context->result->reads;
+    profile->mapped = core->tid >= 0 && !(core->flag & BAM_FUNMAP);
+    profile->clean = 0;
+    if (increment_counter(&stats->n_reads, "read") ||
+        add_counter(&stats->n_data, (uint64_t)core->l_qseq, "raw data"))
+        return -1;
+    int qc_fail = (core->flag & BAM_FQCFAIL) != 0;
+    int duplicate = (core->flag & BAM_FDUP) != 0;
+    if (qc_fail && increment_counter(&stats->n_qcfail, "QC-fail read"))
+        return -1;
+    if (core->flag & BAM_FPAIRED) {
+        if (increment_counter(&stats->n_pair_all, "paired-read") ||
+            ((core->flag & BAM_FPROPER_PAIR) && profile->mapped &&
+             !(core->flag & BAM_FMUNMAP) &&
+             increment_counter(&stats->n_pair_good, "proper-pair")) ||
+            ((core->flag & BAM_FREAD1) &&
+             increment_counter(&stats->n_read1, "read1")) ||
+            ((core->flag & BAM_FREAD2) &&
+             increment_counter(&stats->n_read2, "read2")))
+            return -1;
+        if (profile->mapped && (core->flag & BAM_FMUNMAP) &&
+            increment_counter(&stats->n_sgltn, "singleton"))
+            return -1;
+        if (profile->mapped && !(core->flag & BAM_FMUNMAP)) {
+            if (increment_counter(&stats->n_pair_map, "mapped pair") ||
+                (core->mtid != core->tid &&
+                 increment_counter(&stats->n_diffchr, "different-reference pair")))
+                return -1;
+        }
+    }
+    if (!profile->mapped)
+        return 0;
+    if (increment_counter(&stats->n_mapped, "mapped read") ||
+        add_counter(&stats->n_mdata, (uint64_t)core->l_qseq, "mapped data") ||
+        ((core->flag & BAM_FREVERSE) &&
+         increment_counter(&stats->n_mstrand, "reverse-strand read")) ||
+        (!(core->flag & BAM_FREVERSE) &&
+         increment_counter(&stats->n_pstrand, "forward-strand read")) ||
+        (duplicate && increment_counter(&stats->n_dup, "duplicate read")))
+        return -1;
+    int high_mapq = core->qual >= context->config->mapq;
+    if (high_mapq && increment_counter(&stats->n_qual, "mapQ-qualified read"))
+        return -1;
+    int clean = !qc_fail && !duplicate && high_mapq;
+    if (clean) {
+        if ((core->flag & BAM_FREAD1 &&
+             increment_counter(&stats->n_rmdup1, "rmdup read1")) ||
+            (core->flag & BAM_FREAD2 &&
+             increment_counter(&stats->n_rmdup2, "rmdup read2")))
+            return -1;
+    }
+    profile->clean = clean;
+    return 0;
+}
+
+/* Target/flank hit accounting, insert-size bookkeeping, optional BAM export,
+ * and fragment overlap bookkeeping shared by both paths.  When
+ * fragment_maybe_store() takes ownership of the spans the caller must not
+ * free them; *spans_consumed reports that transfer. */
+static int count_annotation(run_context_t *context, const bam1_t *record)
+{
+    if (context->annotation == NULL) return 0;
+    uint64_t bases = 0, exon = 0, intron = 0, position = (uint64_t)record->core.pos;
+    int plus = 0, minus = 0;
+    const uint32_t *cigar = bam_get_cigar(record);
+    for (uint32_t i = 0; i < record->core.n_cigar; ++i) {
+        int op = bam_cigar_op(cigar[i]);
+        uint64_t length = bam_cigar_oplen(cigar[i]);
+        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
+            annotation_overlap_t overlap;
+            if (annotation_overlap(context->annotation, record->core.tid,
+                                   position, position + length, &overlap) ||
+                u64_add(bases, length, &bases) ||
+                u64_add(exon, overlap.exon, &exon) ||
+                u64_add(intron, overlap.intron, &intron)) {
+                xerror("RNA annotation overlap overflow");
+                return -1;
+            }
+            plus |= overlap.exon_plus != 0;
+            minus |= overlap.exon_minus != 0;
+        }
+        if (bam_cigar_type(op) & 2) position += length;
+    }
+    if (!bases) return 0;
+    rna_stats_t *rna = &context->result->rna;
+    if (exon > bases || intron > bases-exon) return -1;
+    uint64_t intergenic = bases-exon-intron;
+    if (u64_add(rna->exonic.bases,exon,&rna->exonic.bases) ||
+        u64_add(rna->intronic.bases,intron,&rna->intronic.bases) ||
+        u64_add(rna->intergenic.bases,intergenic,&rna->intergenic.bases)) {
+        xerror("RNA distribution base count overflow");
+        return -1;
+    }
+    rna_class_count_t *winner = exon >= intron && exon >= intergenic ? &rna->exonic :
+                                intron >= intergenic ? &rna->intronic : &rna->intergenic;
+    if (increment_counter(&winner->reads,"RNA distribution read")) return -1;
+    if (plus && minus)
+        return increment_counter(&rna->strand_ambiguous,"ambiguous annotation strand read");
+    if (plus || minus) {
+        int same = ((record->core.flag & BAM_FREVERSE) != 0) == minus;
+        size_t quadrant = ((record->core.flag & BAM_FREAD2) ? 2U : 0U) | (same ? 1U : 0U);
+        if (increment_counter(&rna->strand_reads,"annotation strand read") ||
+            increment_counter(&rna->strand_quadrants[quadrant],"annotation strand quadrant"))
+            return -1;
+        if (!(record->core.flag & BAM_FPAIRED)) rna->strand_single_end = 1;
+    }
+    return 0;
+}
+
+/* RNA work is kept outside the shared DNA completion path. */
+static XAMDST_NOINLINE int finish_rna_record(run_context_t *context, const bam1_t *record,
+                             size_t input_index, int has_n)
+{
+    const bam1_core_t *core = &record->core;
+    rna_stats_t *rna = &context->result->rna;
+    int64_t nh = record_aux_int(record, "NH");
+    if (nh < 0 &&
+        increment_counter(&rna->n_nh_missing, "NH-missing mapped record"))
+        return -1;
+    int unique = (nh < 0 || nh == 1);
+    if (unique) {
+        if (increment_counter(&rna->n_unique, "uniquely mapped read"))
+            return -1;
+    } else {
+        if (increment_counter(&rna->multimap_records, "multimap record"))
+            return -1;
+        if (record_aux_int(record, "HI") == -1 &&
+            increment_counter(&rna->hi_missing_records, "HI-missing multimap record"))
+            return -1;
+        if (rna_dedup_add(context->dedup, input_index,
+                         core->flag & (BAM_FREAD1 | BAM_FREAD2),
+                         bam_get_qname(record))) return -1;
+    }
+    if (unique) {
+        if (count_annotation(context, record)) return -1;
+        char xs = record_xs(record);
+        if (xs != 0) {
+            char read_strand = (core->flag & BAM_FREVERSE) != 0 ? '-' : '+';
+            int same = (read_strand == xs);
+            size_t quadrant = ((core->flag & BAM_FREAD2) != 0 ? 2U : 0U) |
+                              (same ? 1U : 0U);
+            if (increment_counter(&rna->xs_quadrants[quadrant], "XS quadrant") ||
+                increment_counter(&rna->xs_reads, "XS-tagged read"))
+                return -1;
+            if (!(core->flag & BAM_FPAIRED))
+                rna->xs_single_end = 1;
+        }
+        if (has_n) {
+            if (increment_counter(&rna->n_spliced, "spliced read"))
+                return -1;
+            /* The walk only recorded the presence of N spans; rescan the
+             * CIGAR once for the per-intron lengths.  Spliced reads are a
+             * minority in typical RNA-seq, so this extra pass is cheap. */
+            uint32_t *cigar = bam_get_cigar(record);
+            for (uint32_t i = 0; i < core->n_cigar; ++i)
+                if (bam_cigar_op(cigar[i]) == BAM_CREF_SKIP) {
+                    if (histogram_total(rna->intron_lengths) == UINT64_MAX ||
+                        histogram_sum(rna->intron_lengths) > UINT64_MAX-bam_cigar_oplen(cigar[i])) {
+                        xerror("RNA intron histogram overflow");
+                        return -1;
+                    }
+                    histogram_add(rna->intron_lengths,
+                                  (uint64_t)bam_cigar_oplen(cigar[i]), 1);
+                }
+        }
+    }
+    return 0;
+}
+
+XAMDST_HOT_INLINE int finish_read_record(run_context_t *context, sam_hdr_t *header,
+                              const bam1_t *record, size_t input_index, int clean,
+                              int has_n, int target_hit, int flank_hit,
+                              fragment_segment_t *spans, size_t nspans,
+                              htsFile *bamout, int *spans_consumed)
+{
+    bam1_core_t const *core = &record->core;
+    read_stats_t *stats = &context->result->reads;
+    *spans_consumed = 0;
+    /* Insert sizes follow the mosdepth convention: the proper-pair read1 of a
+     * same-reference pair passing the duplicate/QC-fail/MAPQ filters.  In RNA
+     * mode the TLEN of a spliced pair spans its introns and would flood the
+     * distribution, so spliced reads are excluded there. */
+    int proper_read1 = (core->flag & BAM_FPAIRED) != 0 &&
+                       (core->flag & BAM_FPROPER_PAIR) != 0 &&
+                       (core->flag & BAM_FREAD1) != 0 &&
+                       !(core->flag & BAM_FMUNMAP) &&
+                       core->mtid == core->tid;
+    if (proper_read1 && clean && core->isize > 0 &&
+        core->isize < context->config->isize &&
+        !(context->config->rna && has_n))
+        histogram_add(context->result->insert_sizes, (uint64_t)core->isize, 1);
+    if (context->config->rna && finish_rna_record(context, record, input_index, has_n))
+        return -1;
+    if (target_hit && increment_counter(&stats->n_tgt, "target read"))
+        return -1;
+    if (flank_hit && increment_counter(&stats->n_flk, "flank read"))
+        return -1;
+    if (target_hit && bamout != NULL && sam_write1(bamout, header, record) < 0) {
+        xerror("failed to write target BAM record");
+        return -1;
+    }
+    if (!context->config->fragment_mode)
+        return 0;
+    const char *qname = bam_get_qname(record);
+    const char *rg = record_rg(record);
+    int fragment_status = fragment_maybe_store(context, input_index, &record->core,
+                                               qname, rg, clean, spans, nspans);
+    if (fragment_status < 0)
+        return -1;
+    *spans_consumed = (fragment_status == 1);
+    return 0;
+}
+
 static int process_alignment(run_context_t *context, sam_hdr_t *header,
                              const bam1_t *record, size_t input_index, htsFile *bamout)
 {
@@ -1161,32 +1623,10 @@ static int process_alignment(run_context_t *context, sam_hdr_t *header,
         xerror("input contains a negative BAM data length");
         return -1;
     }
-    read_stats_t *stats = &context->result->reads;
-    if (increment_counter(&stats->n_reads, "read") ||
-        add_counter(&stats->n_data, (uint64_t)core->l_qseq, "raw data"))
+    record_profile_t profile;
+    if (count_read_stats(context, record, &profile) != 0)
         return -1;
-    int qc_fail = (core->flag & BAM_FQCFAIL) != 0;
-    int duplicate = (core->flag & BAM_FDUP) != 0;
-    int mapped = core->tid >= 0 && !(core->flag & BAM_FUNMAP);
-    if (qc_fail && increment_counter(&stats->n_qcfail, "QC-fail read"))
-        return -1;
-    if (core->flag & BAM_FPAIRED) {
-        if (increment_counter(&stats->n_pair_all, "paired-read") ||
-            ((core->flag & BAM_FPROPER_PAIR) && mapped && !(core->flag & BAM_FMUNMAP) &&
-             increment_counter(&stats->n_pair_good, "proper-pair")) ||
-            ((core->flag & BAM_FREAD1) && increment_counter(&stats->n_read1, "read1")) ||
-            ((core->flag & BAM_FREAD2) && increment_counter(&stats->n_read2, "read2")))
-            return -1;
-        if (mapped && (core->flag & BAM_FMUNMAP) &&
-            increment_counter(&stats->n_sgltn, "singleton"))
-            return -1;
-        if (mapped && !(core->flag & BAM_FMUNMAP)) {
-            if (increment_counter(&stats->n_pair_map, "mapped pair") ||
-                (core->mtid != core->tid && increment_counter(&stats->n_diffchr, "different-reference pair")))
-                return -1;
-        }
-    }
-    if (!mapped)
+    if (!profile.mapped)
         return 0;
     if ((size_t)core->tid >= context->intervals->nchromosomes) {
         xerror("input contains reference id %d outside its header", core->tid);
@@ -1216,146 +1656,36 @@ static int process_alignment(run_context_t *context, sam_hdr_t *header,
     }
     if (validate_qname(record, chromosome->name) != 0)
         return -1;
-    if (increment_counter(&stats->n_mapped, "mapped read") ||
-        add_counter(&stats->n_mdata, (uint64_t)core->l_qseq, "mapped data") ||
-        ((core->flag & BAM_FREVERSE) && increment_counter(&stats->n_mstrand, "reverse-strand read")) ||
-        (!(core->flag & BAM_FREVERSE) && increment_counter(&stats->n_pstrand, "forward-strand read")) ||
-        (duplicate && increment_counter(&stats->n_dup, "duplicate read")))
-        return -1;
-    int high_mapq = core->qual >= context->config->mapq;
-    if (high_mapq && increment_counter(&stats->n_qual, "mapQ-qualified read"))
-        return -1;
-    int clean = !qc_fail && !duplicate && high_mapq;
-    if (clean) {
-        if ((core->flag & BAM_FREAD1 && increment_counter(&stats->n_rmdup1, "rmdup read1")) ||
-            (core->flag & BAM_FREAD2 && increment_counter(&stats->n_rmdup2, "rmdup read2")))
-            return -1;
-    }
-    if (core->isize > 0 && core->isize < context->config->isize)
-        histogram_add(context->result->insert_sizes, (uint64_t)core->isize, 1);
 
-    uint32_t *cigar = bam_get_cigar(record);
-    fragment_segment_t *segments = NULL;
-    size_t nsegments = 0;
-    size_t segment_capacity = 0;
-    uint64_t reference_position = (uint64_t)core->pos;
-    uint64_t query_position = 0;
-    int target_hit = 0;
-    int flank_hit = 0;
-    for (uint32_t i = 0; i < core->n_cigar; ++i) {
-        int op = bam_cigar_op(cigar[i]);
-        uint32_t length = bam_cigar_oplen(cigar[i]);
-        if (length == 0) {
-            xerror("mapped record on %s contains a zero-length CIGAR operation",
-                   chromosome->name);
-            free(segments);
-            return -1;
-        }
-        int consumes_query = (op == BAM_CMATCH || op == BAM_CINS ||
-                              op == BAM_CSOFT_CLIP || op == BAM_CEQUAL ||
-                              op == BAM_CDIFF);
-        if (consumes_query) {
-            if ((uint64_t)length > UINT64_MAX - query_position ||
-                query_position + (uint64_t)length > (uint64_t)core->l_qseq) {
-                xerror("CIGAR query length exceeds sequence length on %s",
-                       chromosome->name);
-                free(segments);
-                return -1;
-            }
-            query_position += (uint64_t)length;
-        }
-        int consumes_reference = (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF ||
-                                  op == BAM_CDEL || op == BAM_CREF_SKIP);
-        if (consumes_reference) {
-            if ((uint64_t)length > UINT64_MAX - reference_position) {
-                xerror("CIGAR reference position overflow");
-                free(segments);
-                return -1;
-            }
-            uint64_t end = reference_position + (uint64_t)length;
-            if (end > chromosome->length) {
-                xerror("CIGAR of record on %s extends beyond chromosome length",
-                       chromosome->name);
-                free(segments);
-                return -1;
-            }
-            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
-                if (context->config->fragment_mode &&
-                    fragment_add_segment(&segments, &nsegments, &segment_capacity,
-                                         reference_position, end, 3U) != 0) {
-                    free(segments);
-                    return -1;
-                }
-                int hit_result = update_chromosome_delta(chromosome, reference_position, end,
-                                                         1, clean ? 1 : 0, 1,
-                                                         context->config->summary_only);
-                if (hit_result < 0) {
-                    free(segments);
-                    return -1;
-                }
-                /* The unified walk returns a hit for either target or flank;
-                 * retain the individual flags for read-level diagnostics. */
-                target_hit |= (hit_result & 1) != 0;
-                flank_hit |= (hit_result & 2) != 0;
-            } else if (op == BAM_CDEL) {
-                if (context->config->fragment_mode &&
-                    fragment_add_segment(&segments, &nsegments, &segment_capacity,
-                                         reference_position, end, 2U) != 0) {
-                    free(segments);
-                    return -1;
-                }
-                int hit_result = update_chromosome_delta(chromosome, reference_position, end,
-                                                         0, 0, 1,
-                                                         context->config->summary_only);
-                if (hit_result < 0) {
-                    free(segments);
-                    return -1;
-                }
-                target_hit |= (hit_result & 1) != 0;
-                flank_hit |= (hit_result & 2) != 0;
-            }
-            reference_position = end;
-        } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP || op == BAM_CPAD) {
-            /* These operations do not advance the reference position. */
-        } else {
-            xerror("unsupported CIGAR operation %d", op);
-            free(segments);
-            return -1;
-        }
-    }
-    if (query_position != (uint64_t)core->l_qseq) {
-        xerror("CIGAR query length does not match sequence length on %s",
-               chromosome->name);
-        free(segments);
+    int unique = record_unique(context->config, record);
+    if (unique < 0) return -1;
+    cigar_walk_t walk;
+    direct_span_ctx_t span_ctx = {
+        .chromosome = chromosome,
+        .clean = profile.clean,
+        .summary_only = context->config->summary_only,
+        .max_region_mem = context->config->max_region_mem,
+        .depth_enabled = unique,
+        .target_hit = 0,
+        .flank_hit = 0,
+    };
+    /* Spans are only collected when a downstream consumer needs them after
+     * the walk; otherwise the handler consumes them on the fly with zero
+     * allocation. */
+    int collect = context->config->fragment_mode;
+    if (walk_cigar(chromosome, record, collect, direct_span_handler,
+                   &span_ctx, &walk) != 0)
+        return -1;
+    int spans_consumed = 0;
+    if (finish_read_record(context, header, record, input_index, profile.clean,
+                           walk.has_n, span_ctx.target_hit, span_ctx.flank_hit,
+                           walk.spans, walk.nspans, bamout,
+                           &spans_consumed) != 0) {
+        free(walk.spans);
         return -1;
     }
-    if (target_hit && increment_counter(&stats->n_tgt, "target read")) {
-        free(segments);
-        return -1;
-    }
-    if (flank_hit && increment_counter(&stats->n_flk, "flank read")) {
-        free(segments);
-        return -1;
-    }
-    if (target_hit && bamout != NULL && sam_write1(bamout, header, record) < 0) {
-        xerror("failed to write target BAM record");
-        free(segments);
-        return -1;
-    }
-    const char *qname = NULL;
-    const char *rg = NULL;
-    if (context->config->fragment_mode) {
-        qname = bam_get_qname(record);
-        rg = record_rg(record);
-    }
-    int fragment_status = fragment_maybe_store(context, input_index, core, qname, rg,
-                                               clean, segments, nsegments);
-    if (fragment_status < 0) {
-        free(segments);
-        return -1;
-    }
-    if (fragment_status == 0)
-        free(segments);
+    if (!spans_consumed)
+        free(walk.spans);
     return 0;
 }
 
@@ -1372,6 +1702,8 @@ typedef struct {
     int status;
     int mapped;
     int clean;
+    int unique;
+    int has_n;
     int target_hit;
     int flank_hit;
     alignment_delta_t *deltas;
@@ -1437,6 +1769,21 @@ static int prepare_alignment_deltas(const chromosome_intervals_t *chromosome,
     return 0;
 }
 
+/* Worker-side span handler: expand each span into private event deltas
+ * instead of touching the coverage windows directly. */
+typedef struct {
+    const chromosome_intervals_t *chromosome;
+    alignment_event_t *event;
+} event_span_ctx_t;
+
+static int event_span_handler(void *opaque, uint64_t start, uint64_t end,
+                              unsigned kind)
+{
+    event_span_ctx_t *ctx = (event_span_ctx_t *)opaque;
+    return prepare_alignment_deltas(ctx->chromosome, start, end, kind,
+                                    ctx->event);
+}
+
 /* Worker-side CIGAR validation and segmentation.  This function only reads
  * immutable header/interval/config state and writes its private event. */
 static int prepare_alignment_event(const run_context_t *context,
@@ -1458,17 +1805,22 @@ static int prepare_alignment_event(const run_context_t *context,
     if (!event->mapped)
         return 0;
     if ((size_t)core->tid >= context->intervals->nchromosomes) {
-        xerror("input contains a reference id outside its header");
+        xerror("input contains reference id %d outside its header", core->tid);
         return -1;
     }
     if (core->pos < 0) {
-        xerror("mapped record has a negative position");
+        xerror("mapped record on %s has a negative position",
+               context->intervals->chromosomes[core->tid].name);
         return -1;
     }
     chromosome_intervals_t *chromosome = &context->intervals->chromosomes[core->tid];
-    if ((uint64_t)core->pos > chromosome->length || core->n_cigar == 0 ||
-        record->data == NULL) {
-        xerror("mapped record on %s has an invalid CIGAR/position", chromosome->name);
+    if ((uint64_t)core->pos > chromosome->length) {
+        xerror("mapped record on %s starts beyond chromosome length",
+               chromosome->name);
+        return -1;
+    }
+    if (core->n_cigar == 0 || record->data == NULL) {
+        xerror("mapped record on %s has no CIGAR", chromosome->name);
         return -1;
     }
     size_t cigar_bytes;
@@ -1480,68 +1832,24 @@ static int prepare_alignment_event(const run_context_t *context,
     }
     if (validate_qname(record, chromosome->name) != 0)
         return -1;
-    uint32_t *cigar = bam_get_cigar(record);
-    uint64_t reference_position = (uint64_t)core->pos;
-    uint64_t query_position = 0;
-    size_t capacity = 0;
-    for (uint32_t i = 0; i < core->n_cigar; ++i) {
-        int op = bam_cigar_op(cigar[i]);
-        uint32_t length = bam_cigar_oplen(cigar[i]);
-        if (length == 0) {
-            xerror("mapped record on %s contains a zero-length CIGAR operation",
-                   chromosome->name);
-            return -1;
-        }
-        int consumes_query = (op == BAM_CMATCH || op == BAM_CINS ||
-                              op == BAM_CSOFT_CLIP || op == BAM_CEQUAL ||
-                              op == BAM_CDIFF);
-        if (consumes_query) {
-            if ((uint64_t)length > UINT64_MAX - query_position ||
-                query_position + (uint64_t)length > (uint64_t)core->l_qseq) {
-                xerror("CIGAR query length exceeds sequence length on %s",
-                       chromosome->name);
-                return -1;
-            }
-            query_position += (uint64_t)length;
-        }
-        int consumes_reference = (op == BAM_CMATCH || op == BAM_CEQUAL ||
-                                  op == BAM_CDIFF || op == BAM_CDEL ||
-                                  op == BAM_CREF_SKIP);
-        if (!consumes_reference) {
-            if (op != BAM_CINS && op != BAM_CSOFT_CLIP && op != BAM_CHARD_CLIP &&
-                op != BAM_CPAD) {
-                xerror("unsupported CIGAR operation %d", op);
-                return -1;
-            }
-            continue;
-        }
-        if ((uint64_t)length > UINT64_MAX - reference_position) {
-            xerror("CIGAR reference position overflow");
-            return -1;
-        }
-        uint64_t end = reference_position + (uint64_t)length;
-        if (end > chromosome->length) {
-            xerror("CIGAR of record on %s extends beyond chromosome length",
-                   chromosome->name);
-            return -1;
-        }
-        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF || op == BAM_CDEL) {
-            unsigned kind = (op == BAM_CDEL) ? 2U : 3U;
-            if (context->config->fragment_mode &&
-                fragment_add_segment(&event->segments, &event->nsegments, &capacity,
-                                     reference_position, end, kind) != 0)
-                return -1;
-            if (prepare_alignment_deltas(chromosome, reference_position, end, kind,
-                                         event) != 0)
-                return -1;
-        }
-        reference_position = end;
-    }
-    if (query_position != (uint64_t)core->l_qseq) {
-        xerror("CIGAR query length does not match sequence length on %s",
-               chromosome->name);
+    /* RNA mode: only uniquely mapped records contribute depth.  Multimap
+     * records still go through the full CIGAR validation walk, but with a
+     * NULL span handler so no deltas are recorded; the reducer accounts for
+     * them at read level. */
+    event->unique = record_unique(context->config, record);
+    if (event->unique < 0) return -1;
+    cigar_walk_t walk;
+    event_span_ctx_t span_ctx = {
+        .chromosome = chromosome,
+        .event = event,
+    };
+    int collect = context->config->fragment_mode;
+    cigar_span_handler handler = event->unique ? event_span_handler : NULL;
+    if (walk_cigar(chromosome, record, collect, handler, &span_ctx, &walk) != 0)
         return -1;
-    }
+    event->has_n = walk.has_n;
+    event->segments = walk.spans;
+    event->nsegments = walk.nspans;
     return 0;
 }
 
@@ -1549,82 +1857,32 @@ static int apply_alignment_event(run_context_t *context, sam_hdr_t *header,
                                  alignment_event_t *event, htsFile *bamout)
 {
     const bam1_t *record = event->record;
-    const bam1_core_t *core = &record->core;
-    read_stats_t *stats = &context->result->reads;
-    if (increment_counter(&stats->n_reads, "read") ||
-        add_counter(&stats->n_data, (uint64_t)core->l_qseq, "raw data"))
+    record_profile_t profile;
+    if (count_read_stats(context, record, &profile) != 0)
         return -1;
-    int qc_fail = (core->flag & BAM_FQCFAIL) != 0;
-    int duplicate = (core->flag & BAM_FDUP) != 0;
-    if (qc_fail && increment_counter(&stats->n_qcfail, "QC-fail read"))
-        return -1;
-    if (core->flag & BAM_FPAIRED) {
-        int mapped = event->mapped;
-        if (increment_counter(&stats->n_pair_all, "paired-read") ||
-            ((core->flag & BAM_FPROPER_PAIR) && mapped && !(core->flag & BAM_FMUNMAP) &&
-             increment_counter(&stats->n_pair_good, "proper-pair")) ||
-            ((core->flag & BAM_FREAD1) && increment_counter(&stats->n_read1, "read1")) ||
-            ((core->flag & BAM_FREAD2) && increment_counter(&stats->n_read2, "read2")))
-            return -1;
-        if (mapped && (core->flag & BAM_FMUNMAP) &&
-            increment_counter(&stats->n_sgltn, "singleton"))
-            return -1;
-        if (mapped && !(core->flag & BAM_FMUNMAP) &&
-            (increment_counter(&stats->n_pair_map, "mapped pair") ||
-             (core->mtid != core->tid &&
-              increment_counter(&stats->n_diffchr, "different-reference pair"))))
-            return -1;
-    }
-    if (!event->mapped)
+    if (!profile.mapped)
         return 0;
-    if (increment_counter(&stats->n_mapped, "mapped read") ||
-        add_counter(&stats->n_mdata, (uint64_t)core->l_qseq, "mapped data") ||
-        ((core->flag & BAM_FREVERSE) && increment_counter(&stats->n_mstrand, "reverse-strand read")) ||
-        (!(core->flag & BAM_FREVERSE) && increment_counter(&stats->n_pstrand, "forward-strand read")) ||
-        (duplicate && increment_counter(&stats->n_dup, "duplicate read")))
-        return -1;
-    int high_mapq = core->qual >= context->config->mapq;
-    if (high_mapq && increment_counter(&stats->n_qual, "mapQ-qualified read"))
-        return -1;
-    int clean = !qc_fail && !duplicate && high_mapq;
-    if (clean && (((core->flag & BAM_FREAD1) &&
-                   increment_counter(&stats->n_rmdup1, "rmdup read1")) ||
-                  ((core->flag & BAM_FREAD2) &&
-                   increment_counter(&stats->n_rmdup2, "rmdup read2"))))
-        return -1;
-    if (core->isize > 0 && core->isize < context->config->isize)
-        histogram_add(context->result->insert_sizes, (uint64_t)core->isize, 1);
-
+    /* profile.clean recomputes the same pure flag/MAPQ decision the worker
+     * stored in event->clean, so the reducer needs no worker state. */
     for (size_t i = 0; i < event->ndeltas; ++i) {
         const alignment_delta_t *delta = &event->deltas[i];
         int match = (delta->kind & 1U) != 0;
         if (update_region_delta(delta->region, delta->start, delta->end,
                                 match ? 1 : 0,
-                                match && clean ? 1 : 0,
+                                match && profile.clean ? 1 : 0,
                                 (delta->kind & 2U) ? 1 : 0,
-                                context->config->summary_only) < 0)
+                                context->config->summary_only,
+                                context->config->max_region_mem) < 0)
             return -1;
     }
-    if (event->target_hit && increment_counter(&stats->n_tgt, "target read"))
+    int spans_consumed = 0;
+    if (finish_read_record(context, header, record, event->input_index,
+                           profile.clean, event->has_n,
+                           event->target_hit, event->flank_hit,
+                           event->segments, event->nsegments, bamout,
+                           &spans_consumed) != 0)
         return -1;
-    if (event->flank_hit && increment_counter(&stats->n_flk, "flank read"))
-        return -1;
-    if (event->target_hit && bamout != NULL && sam_write1(bamout, header, record) < 0) {
-        xerror("failed to write target BAM record");
-        return -1;
-    }
-    const char *qname = NULL;
-    const char *rg = NULL;
-    if (context->config->fragment_mode) {
-        qname = bam_get_qname(record);
-        rg = record_rg(record);
-    }
-    int fragment_status = fragment_maybe_store(context, event->input_index, core,
-                                               qname, rg, clean,
-                                               event->segments, event->nsegments);
-    if (fragment_status < 0)
-        return -1;
-    if (fragment_status == 1) {
+    if (spans_consumed) {
         event->segments = NULL;
         event->nsegments = 0;
     }
@@ -1777,6 +2035,7 @@ static int analysis_run_parallel(const xamdst_config_t *config,
         .result = result,
         .sink = sink,
     };
+    if (rna_context_init(&context, inputs->header)) return -1;
     stream_cursor_t *cursors = xcalloc(inputs->count, sizeof(*cursors));
     size_t *heap = xcalloc(inputs->count == 0 ? 1 : inputs->count, sizeof(*heap));
     size_t heap_size = 0;
@@ -1903,6 +2162,7 @@ static int analysis_run_parallel(const xamdst_config_t *config,
     for (size_t i = 0; i < batch_size; ++i)
         alignment_event_destroy(&events[i]);
     fragment_clear(&context);
+    error = rna_context_finish(&context, error);
     compute_pool_destroy(&pool);
     for (size_t i = 0; i < inputs->count; ++i)
         bam_destroy1(cursors[i].record);
@@ -1930,6 +2190,7 @@ int analysis_run(const xamdst_config_t *config, const input_set_t *inputs,
         .result = result,
         .sink = sink,
     };
+    if (rna_context_init(&context, inputs->header)) return -1;
     stream_cursor_t *cursors = xcalloc(inputs->count, sizeof(*cursors));
     size_t *heap = xcalloc(inputs->count == 0 ? 1 : inputs->count, sizeof(*heap));
     size_t heap_size = 0;
@@ -2015,6 +2276,7 @@ int analysis_run(const xamdst_config_t *config, const input_set_t *inputs,
         }
     }
     fragment_clear(&context);
+    error = rna_context_finish(&context, error);
     for (size_t i = 0; i < inputs->count; ++i)
         bam_destroy1(cursors[i].record);
     free(heap);

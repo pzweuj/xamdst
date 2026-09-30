@@ -73,12 +73,9 @@ static int paths_equal(const char *left, const char *right)
 
 static int path_equals_output(const xamdst_config_t *config, const char *path)
 {
-    static const char *const names[] = {
-        "coverage.report", "coverage.report.json", "cumu.plot", "insert.plot",
-        "chromosome.report", "region.tsv.gz", "depth.tsv.gz", "uncover.bed"
-    };
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
-        char *output = path_join(config->outdir, names[i]);
+    size_t count = REPORT_MAX_OUTPUTS;
+    for (size_t i = 0; i < count; ++i) {
+        char *output = path_join(config->outdir, report_output_names[i]);
         int equal = paths_equal(output, path);
         free(output);
         if (equal)
@@ -106,21 +103,21 @@ static int path_equals_protected_file(const xamdst_config_t *config, const char 
         return 1;
     if (config->reference != NULL && paths_equal(config->reference, path))
         return 1;
+    if (config->annotation_path != NULL && paths_equal(config->annotation_path, path))
+        return 1;
     return 0;
 }
 
 static int report_path_conflicts(const xamdst_config_t *config)
 {
-    static const char *const names[] = {
-        "coverage.report", "coverage.report.json", "cumu.plot", "insert.plot",
-        "chromosome.report", "region.tsv.gz", "depth.tsv.gz", "uncover.bed"
-    };
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
-        char *output = path_join(config->outdir, names[i]);
+    size_t count = REPORT_MAX_OUTPUTS;
+    for (size_t i = 0; i < count; ++i) {
+        char *output = path_join(config->outdir, report_output_names[i]);
         int conflict = path_equals_protected_file(config, output);
         free(output);
         if (conflict) {
-            xerror("output report '%s' would overwrite a protected input file", names[i]);
+            xerror("output report '%s' would overwrite a protected input file",
+                   report_output_names[i]);
             return -1;
         }
     }
@@ -273,7 +270,7 @@ int main(int argc, char **argv)
     }
 
     analysis_result_t result;
-    analysis_result_init(&result, &intervals);
+    analysis_result_init(&result, &intervals, &config);
     report_writer_t writer;
     if (report_open(&writer, config.outdir, &config)) {
         analysis_result_destroy(&result);

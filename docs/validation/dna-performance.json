@@ -1,0 +1,467 @@
+{
+  "baseline_revision": "af559ba",
+  "candidate_version": "3.2.0",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "flags": "-O2 -g -std=c99 -Wall -Wextra -Wpedantic -Wformat=2 -Werror",
+  "rounds": 5,
+  "scale": 5,
+  "cases": [
+    {
+      "dataset": "panel",
+      "reference_length": 40000,
+      "read_length": 100,
+      "records": 4990000,
+      "input_bytes": 1236130050,
+      "compute_threads": 1,
+      "summary_only": false,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          1.124242430999999,
+          1.5909129019999995,
+          1.6444077330000013,
+          0.9972011589999994,
+          0.9788968799999935
+        ],
+        "candidate": [
+          1.779631418000001,
+          1.6686383629999995,
+          2.704212808000001,
+          1.2483305929999915,
+          0.9513428200000078
+        ]
+      },
+      "median_seconds": {
+        "baseline": 1.124242430999999,
+        "candidate": 1.6686383629999995
+      },
+      "change_percent": 48.42335754182194,
+      "cpu_seconds": {
+        "baseline": [
+          1.1388990000000003,
+          1.0045789999999997,
+          1.041195,
+          0.99085,
+          0.9725880000000018
+        ],
+        "candidate": [
+          0.974024,
+          0.9842750000000002,
+          0.984903000000001,
+          0.9753379999999989,
+          0.940999999999999
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 1.0045789999999997,
+        "candidate": 0.9753379999999989
+      },
+      "cpu_change_percent": -2.9107715769492226
+    },
+    {
+      "dataset": "panel",
+      "reference_length": 40000,
+      "read_length": 100,
+      "records": 4990000,
+      "input_bytes": 1236130050,
+      "compute_threads": 1,
+      "summary_only": true,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          1.053036431999999,
+          1.058173839999995,
+          1.0155744449999986,
+          1.1515814139999918,
+          1.019666887999989
+        ],
+        "candidate": [
+          0.9558283020000005,
+          0.9674810079999929,
+          0.9819691550000016,
+          0.9565175350000032,
+          0.9182271730000053
+        ]
+      },
+      "median_seconds": {
+        "baseline": 1.053036431999999,
+        "candidate": 0.9565175350000032
+      },
+      "change_percent": -9.165769964547232,
+      "cpu_seconds": {
+        "baseline": [
+          1.0500340000000001,
+          1.0550080000000008,
+          1.0124129999999987,
+          1.042307000000001,
+          1.0167560000000009
+        ],
+        "candidate": [
+          0.948005000000002,
+          0.9609129999999979,
+          0.9742040000000003,
+          0.9484369999999984,
+          0.9515820000000019
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 1.042307000000001,
+        "candidate": 0.9515820000000019
+      },
+      "cpu_change_percent": -8.704249323855539
+    },
+    {
+      "dataset": "panel",
+      "reference_length": 40000,
+      "read_length": 100,
+      "records": 4990000,
+      "input_bytes": 1236130050,
+      "compute_threads": 4,
+      "summary_only": false,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          2.8068983659999986,
+          2.8034115749999984,
+          2.774912607999994,
+          3.0342889989999975,
+          3.0143723609999995
+        ],
+        "candidate": [
+          2.804887106999999,
+          2.8645487809999963,
+          2.9604567819999943,
+          3.089714501000003,
+          2.7451660549999986
+        ]
+      },
+      "median_seconds": {
+        "baseline": 2.8068983659999986,
+        "candidate": 2.8645487809999963
+      },
+      "change_percent": 2.053883236326537,
+      "cpu_seconds": {
+        "baseline": [
+          4.280789999999996,
+          3.900869,
+          3.939318,
+          4.247066000000004,
+          4.180479000000005
+        ],
+        "candidate": [
+          4.070577999999998,
+          4.207096000000007,
+          4.372889000000001,
+          4.417076999999992,
+          4.157949000000002
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 4.180479000000005,
+        "candidate": 4.207096000000007
+      },
+      "cpu_change_percent": 0.6366973736741999
+    },
+    {
+      "dataset": "panel",
+      "reference_length": 40000,
+      "read_length": 100,
+      "records": 4990000,
+      "input_bytes": 1236130050,
+      "compute_threads": 4,
+      "summary_only": true,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          2.6808757030000123,
+          2.732905697999996,
+          3.514744095999987,
+          3.1972098930000072,
+          3.300085053999993
+        ],
+        "candidate": [
+          2.8758402020000062,
+          2.944251095999988,
+          3.2556654539999954,
+          2.992854819999991,
+          3.7908399990000134
+        ]
+      },
+      "median_seconds": {
+        "baseline": 3.1972098930000072,
+        "candidate": 2.992854819999991
+      },
+      "change_percent": -6.391668981365051,
+      "cpu_seconds": {
+        "baseline": [
+          3.8562610000000035,
+          3.9577839999999895,
+          5.168699000000004,
+          4.721079999999986,
+          4.888770000000008
+        ],
+        "candidate": [
+          4.132323999999997,
+          4.279200000000003,
+          4.61344600000001,
+          4.239936999999998,
+          5.496858000000003
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 4.721079999999986,
+        "candidate": 4.279200000000003
+      },
+      "cpu_change_percent": -9.359722775296852
+    },
+    {
+      "dataset": "broad",
+      "reference_length": 2000000,
+      "read_length": 100,
+      "records": 4999800,
+      "input_bytes": 1247172252,
+      "compute_threads": 1,
+      "summary_only": false,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          1.340370371000006,
+          1.2481472579999888,
+          1.2430710950000048,
+          1.2123412159999987,
+          1.2114666880000016
+        ],
+        "candidate": [
+          1.9953051680000158,
+          1.356977836999988,
+          1.2205151729999955,
+          1.1943684749999761,
+          1.17912489699998
+        ]
+      },
+      "median_seconds": {
+        "baseline": 1.2430710950000048,
+        "candidate": 1.2205151729999955
+      },
+      "change_percent": -1.8145319355212908,
+      "cpu_seconds": {
+        "baseline": [
+          1.3462509999999952,
+          1.2379970000000071,
+          1.248344000000003,
+          1.2185289999999895,
+          1.2119619999999998
+        ],
+        "candidate": [
+          1.2940600000000018,
+          1.2938489999999945,
+          1.2066560000000095,
+          1.1926469999999938,
+          1.1893670000000043
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 1.2379970000000071,
+        "candidate": 1.2066560000000095
+      },
+      "cpu_change_percent": -2.531589333414974
+    },
+    {
+      "dataset": "broad",
+      "reference_length": 2000000,
+      "read_length": 100,
+      "records": 4999800,
+      "input_bytes": 1247172252,
+      "compute_threads": 1,
+      "summary_only": true,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          1.000319533999999,
+          0.9825618639999902,
+          1.0433238330000165,
+          1.0197263699999723,
+          1.013390352000016
+        ],
+        "candidate": [
+          0.965122880999985,
+          0.9578506439999899,
+          0.9464803009999798,
+          0.9499550999999826,
+          0.9471692369999971
+        ]
+      },
+      "median_seconds": {
+        "baseline": 1.013390352000016,
+        "candidate": 0.9499550999999826
+      },
+      "change_percent": -6.25970553941414,
+      "cpu_seconds": {
+        "baseline": [
+          0.9913239999999917,
+          0.9980570000000171,
+          1.0526089999999897,
+          1.0284490000000233,
+          1.0299079999999776
+        ],
+        "candidate": [
+          0.974930999999998,
+          0.9694079999999872,
+          0.9572840000000156,
+          0.9603719999999782,
+          0.9605630000000076
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 1.0284490000000233,
+        "candidate": 0.9605630000000076
+      },
+      "cpu_change_percent": -6.600813457936572
+    },
+    {
+      "dataset": "broad",
+      "reference_length": 2000000,
+      "read_length": 100,
+      "records": 4999800,
+      "input_bytes": 1247172252,
+      "compute_threads": 4,
+      "summary_only": false,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          3.0613734339999894,
+          3.261357970000006,
+          3.1059372949999897,
+          3.037783638999997,
+          2.9584920309999916
+        ],
+        "candidate": [
+          3.713500664999998,
+          3.794777974999988,
+          3.0841546300000005,
+          3.22479333199999,
+          2.9950569410000014
+        ]
+      },
+      "median_seconds": {
+        "baseline": 3.0613734339999894,
+        "candidate": 3.22479333199999
+      },
+      "change_percent": 5.338123607693168,
+      "cpu_seconds": {
+        "baseline": [
+          4.265836000000007,
+          4.602087999999981,
+          4.378401000000025,
+          4.22593999999998,
+          4.141655000000014
+        ],
+        "candidate": [
+          5.403347999999994,
+          5.521211000000022,
+          4.257967999999977,
+          4.533500000000004,
+          4.199533000000031
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 4.265836000000007,
+        "candidate": 4.533500000000004
+      },
+      "cpu_change_percent": 6.2745965855226515
+    },
+    {
+      "dataset": "broad",
+      "reference_length": 2000000,
+      "read_length": 100,
+      "records": 4999800,
+      "input_bytes": 1247172252,
+      "compute_threads": 4,
+      "summary_only": true,
+      "depth_and_counts_equivalent": true,
+      "expected_report_changes": [
+        "version/schema_version",
+        "plot cumulative > to >="
+      ],
+      "seconds": {
+        "baseline": [
+          2.7298791230000177,
+          2.7738318739999954,
+          2.7491152150000175,
+          2.689828428999988,
+          2.732406703999999
+        ],
+        "candidate": [
+          2.837593525000017,
+          2.7744961209999985,
+          2.801988212999987,
+          2.7750292049999814,
+          2.869997964999982
+        ]
+      },
+      "median_seconds": {
+        "baseline": 2.732406703999999,
+        "candidate": 2.801988212999987
+      },
+      "change_percent": 2.5465282638242437,
+      "cpu_seconds": {
+        "baseline": [
+          3.9204520000000116,
+          4.028080999999986,
+          4.033464999999978,
+          3.833816000000013,
+          3.903834999999958
+        ],
+        "candidate": [
+          4.09868000000003,
+          3.9742940000000146,
+          4.0002500000000225,
+          3.965653000000003,
+          4.088540000000023
+        ]
+      },
+      "median_cpu_seconds": {
+        "baseline": 3.9204520000000116,
+        "candidate": 4.0002500000000225
+      },
+      "cpu_change_percent": 2.0354285679307083
+    }
+  ],
+  "candidate_sha256": "f14c7c242899c786d4fcb528d60b5142a923f77f1f02977f08386654f992f394",
+  "affinity_cpus": [
+    12,
+    13,
+    14,
+    15
+  ],
+  "baseline_version": "3.1.0"
+}
